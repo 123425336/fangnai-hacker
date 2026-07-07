@@ -1,0 +1,15 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "com.fangnai.hacker.mixin",
+  "compatibilityLevel": "JAVA_17",
+  "refmap": "hacker.refmap.json",
+  "client": [
+    "MixinClientPacketListener",
+    "MixinMinecraft",
+    "MixinScreen"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
