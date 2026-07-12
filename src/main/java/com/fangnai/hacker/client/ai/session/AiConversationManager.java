@@ -340,6 +340,16 @@ public final class AiConversationManager {
                     workflowHandled = true;
                 }
             } else {
+                JarWorkflowContext workflow = jarWorkflowContext.get();
+                if (workflow != null) {
+                    LOGGER.warn("[Fangnai AI] Unknown workflow tool call rejected and returned to AI: {}", call.name());
+                    handledTool = true;
+                    workflowHandled = true;
+                    readOnlyContinuationStarted = true;
+                    retryWorkflowAfterProtocolError(workflow, call.name(),
+                            "工具不存在或不能解析；arguments=" + truncate(call.arguments().toString(), 1200));
+                    break;
+                }
                 LOGGER.warn("[Fangnai AI] Unknown tool call ignored: {}", call.name());
                 rememberAssistantEvent("AI proposed unknown tool call and it was ignored: " + call.name());
             }
@@ -505,7 +515,9 @@ public final class AiConversationManager {
         }
         JarWorkflowContext workflow = jarWorkflowContext.get();
         if (workflow != null) {
-            finishWorkflow(workflow, false, "jar 自动分析流程中不允许 inspect_saved_tool；请只提出 jar_analysis 或 compile_define_java_class。 ");
+            retryWorkflowAfterProtocolError(workflow, call.name(),
+                    "jar 自动分析流程中不允许 inspect_saved_tool；该调用未执行。arguments="
+                            + truncate(call.arguments().toString(), 1200));
             return true;
         }
         JsonObject args = call.arguments();
@@ -552,7 +564,33 @@ public final class AiConversationManager {
             preflightAndDefineForWorkflow(context.withPhase("defining"), javaProposal);
             return;
         }
-        finishWorkflow(context, false, "AI 在 jar 自动分析流程中提出了不允许的操作：" + proposal.type());
+        retryWorkflowAfterProtocolError(context, proposal.type(),
+                "AI 在 jar 自动分析流程中提出了不允许的操作；summary=" + truncate(proposal.summary(), 1200));
+    }
+
+    private void retryWorkflowAfterProtocolError(JarWorkflowContext context, String attemptedTool, String error) {
+        HackerClientConfig.AiSettings settings = HackerClientConfig.ai();
+        if (context.aiTurns() >= settings.jarAnalysisWorkflowMaxAiTurns) {
+            finishWorkflow(context, false, "AI 工具协议纠错达到工作流最大轮数："
+                    + settings.jarAnalysisWorkflowMaxAiTurns + "。最后错误：" + error);
+            return;
+        }
+        JarWorkflowContext next = context.withAiTurns(context.aiTurns() + 1).withPhase("protocol_correction");
+        jarWorkflowContext.set(next);
+        String prompt = buildWorkflowProtocolCorrectionPrompt(next, attemptedTool, error);
+        if (prompt.length() > settings.jarAnalysisWorkflowPromptMaxChars) {
+            prompt = prompt.substring(0, settings.jarAnalysisWorkflowPromptMaxChars)
+                    + "\n...工作流协议纠错 prompt 已截断...";
+        }
+        List<AiMessage> messages = buildConversationMessages(settings, prompt);
+        rememberAssistantEvent("jar workflow " + next.workflowId() + " rejected invalid tool " + attemptedTool
+                + " and requested correction at AI turn " + next.aiTurns() + ".");
+        ChatFeedback.warn("jar 自动分析流程收到不允许的工具 " + attemptedTool
+                + "；已把错误返回 AI 并继续流程（AI 轮次 " + next.aiTurns() + "/"
+                + settings.jarAnalysisWorkflowMaxAiTurns + "）。");
+        if (!sendMessages(messages, prompt.length(), "正在把工作流工具错误返回 AI 并继续：")) {
+            finishWorkflow(next, false, "无法发送工作流协议纠错请求。 ");
+        }
     }
 
     private void runWorkflowJarAnalysis(JarWorkflowContext context, JarAnalysisProposal proposal) {
@@ -597,7 +635,9 @@ public final class AiConversationManager {
             return;
         }
         JarWorkflowContext next = context.withAiTurns(context.aiTurns() + 1).withPhase("ai_continuation")
-                .withLastAnalysis(result.title());
+                .withLastAnalysis(result.title())
+                .withLastAnalysisContext("完整输出路径：" + result.outputPath() + "\n分析内容预览：\n"
+                        + truncate(result.content(), settings.jarAnalysisWorkflowResultPreviewChars));
         jarWorkflowContext.set(next);
         String prompt = buildWorkflowContinuationPrompt(next, result);
         if (prompt.length() > settings.jarAnalysisWorkflowPromptMaxChars) {
@@ -858,6 +898,29 @@ public final class AiConversationManager {
                 + "限制：每轮最多一个工具；不要调用无关工具；不要声称已经执行；生成类必须在 package com.fangnai.hacker.generated；修复同一工具必须复用同一 className；不要生成 V2/V3/New 后缀类名。";
     }
 
+    private static String buildWorkflowProtocolCorrectionPrompt(JarWorkflowContext context,
+                                                                 String attemptedTool, String error) {
+        HackerClientConfig.AiSettings settings = HackerClientConfig.ai();
+        return "这是仍在进行中的、已获玩家授权的 jar 自动分析/生成/define 工作流。你上一轮调用了不允许或无法解析的工具；该工具没有执行，工作流没有终止。请根据错误立即纠正并继续。\n"
+                + "workflowId=" + context.workflowId() + "\n"
+                + "原始目标/原因：" + context.goal() + "\n"
+                + "预期效果：" + context.expectedEffect() + "\n"
+                + "错误工具：" + attemptedTool + "\n"
+                + "协议错误：" + error + "\n"
+                + "进度：analysisSteps=" + context.analysisSteps() + "/" + settings.jarAnalysisWorkflowMaxAnalysisSteps
+                + ", aiTurns=" + context.aiTurns() + "/" + settings.jarAnalysisWorkflowMaxAiTurns
+                + ", defineAttempts=" + context.defineAttempts() + "/" + settings.jarAnalysisWorkflowMaxDefineAttempts
+                + ", repairs=" + context.compileRepairs() + "/" + settings.jarAnalysisWorkflowMaxCompileRepairAttempts + "\n"
+                + (context.lastAnalysis().isBlank() ? "" : "最近分析：" + context.lastAnalysis() + "\n")
+                + (context.lastAnalysisContext().isBlank() ? "" : "\n最近一次分析上下文：\n```text\n"
+                + context.lastAnalysisContext() + "\n```\n")
+                + "\n下一步必须且只能选择以下之一：\n"
+                + "1. 信息不足：调用 propose_jar_analysis，且一轮只调用一次；\n"
+                + "2. 信息足够：调用 propose_compile_define_java_class，提供完整 Java 源码；\n"
+                + "3. 确实无法继续：直接用文本说明具体原因。\n"
+                + "禁止调用 inspect_saved_tool、execute_saved_tool 或其他无关工具；不要重复刚才的错误工具；不要声称未执行的操作已经完成。";
+    }
+
     private static String buildWorkflowRepairPrompt(JarWorkflowContext context, JavaSourceDefineProposal proposal,
                                                     String diagnostics, String failureMessage) {
         HackerClientConfig.AiSettings settings = HackerClientConfig.ai();
@@ -946,47 +1009,52 @@ public final class AiConversationManager {
     private record JarWorkflowContext(String workflowId, JarAnalysisProposal initialProposal, String goal,
                                       String expectedEffect, int analysisSteps, int aiTurns, int compileRepairs,
                                       int defineAttempts, String phase, long startedAtMillis, String lastAnalysis,
-                                      String className) {
+                                      String className, String lastAnalysisContext) {
         private JarWorkflowContext(String workflowId, JarAnalysisProposal initialProposal, String goal,
                                    String expectedEffect, int analysisSteps, int aiTurns, int compileRepairs,
                                    int defineAttempts, String phase, long startedAtMillis, String lastAnalysis) {
             this(workflowId, initialProposal, goal, expectedEffect, analysisSteps, aiTurns, compileRepairs,
-                    defineAttempts, phase, startedAtMillis, lastAnalysis, "");
+                    defineAttempts, phase, startedAtMillis, lastAnalysis, "", "");
         }
 
         private JarWorkflowContext withAnalysisSteps(int value) {
             return new JarWorkflowContext(workflowId, initialProposal, goal, expectedEffect, value, aiTurns,
-                    compileRepairs, defineAttempts, phase, startedAtMillis, lastAnalysis, className);
+                    compileRepairs, defineAttempts, phase, startedAtMillis, lastAnalysis, className, lastAnalysisContext);
         }
 
         private JarWorkflowContext withAiTurns(int value) {
             return new JarWorkflowContext(workflowId, initialProposal, goal, expectedEffect, analysisSteps, value,
-                    compileRepairs, defineAttempts, phase, startedAtMillis, lastAnalysis, className);
+                    compileRepairs, defineAttempts, phase, startedAtMillis, lastAnalysis, className, lastAnalysisContext);
         }
 
         private JarWorkflowContext withCompileRepairs(int value) {
             return new JarWorkflowContext(workflowId, initialProposal, goal, expectedEffect, analysisSteps, aiTurns,
-                    value, defineAttempts, phase, startedAtMillis, lastAnalysis, className);
+                    value, defineAttempts, phase, startedAtMillis, lastAnalysis, className, lastAnalysisContext);
         }
 
         private JarWorkflowContext withDefineAttempts(int value) {
             return new JarWorkflowContext(workflowId, initialProposal, goal, expectedEffect, analysisSteps, aiTurns,
-                    compileRepairs, value, phase, startedAtMillis, lastAnalysis, className);
+                    compileRepairs, value, phase, startedAtMillis, lastAnalysis, className, lastAnalysisContext);
         }
 
         private JarWorkflowContext withPhase(String value) {
             return new JarWorkflowContext(workflowId, initialProposal, goal, expectedEffect, analysisSteps, aiTurns,
-                    compileRepairs, defineAttempts, value, startedAtMillis, lastAnalysis, className);
+                    compileRepairs, defineAttempts, value, startedAtMillis, lastAnalysis, className, lastAnalysisContext);
         }
 
         private JarWorkflowContext withLastAnalysis(String value) {
             return new JarWorkflowContext(workflowId, initialProposal, goal, expectedEffect, analysisSteps, aiTurns,
-                    compileRepairs, defineAttempts, phase, startedAtMillis, value, className);
+                    compileRepairs, defineAttempts, phase, startedAtMillis, value, className, lastAnalysisContext);
         }
 
         private JarWorkflowContext withClassName(String value) {
             return new JarWorkflowContext(workflowId, initialProposal, goal, expectedEffect, analysisSteps, aiTurns,
-                    compileRepairs, defineAttempts, phase, startedAtMillis, lastAnalysis, value);
+                    compileRepairs, defineAttempts, phase, startedAtMillis, lastAnalysis, value, lastAnalysisContext);
+        }
+
+        private JarWorkflowContext withLastAnalysisContext(String value) {
+            return new JarWorkflowContext(workflowId, initialProposal, goal, expectedEffect, analysisSteps, aiTurns,
+                    compileRepairs, defineAttempts, phase, startedAtMillis, lastAnalysis, className, value);
         }
     }
 }
