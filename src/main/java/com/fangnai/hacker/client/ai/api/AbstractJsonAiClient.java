@@ -64,14 +64,30 @@ abstract class AbstractJsonAiClient implements AiClient {
         LOGGER.info("[Fangnai AI] HTTP request attempt {}: {} timeout={}s version={}", attempt,
                 httpRequest.uri(), settings.timeoutSeconds, httpRequest.version().orElse(HttpClient.Version.HTTP_1_1));
         return httpClient.sendAsync(httpRequest, HttpResponse.BodyHandlers.ofString())
-                .thenApply(response -> {
+                .thenApply(response -> withModClassLoader(() -> {
                     LOGGER.info("[Fangnai AI] HTTP response attempt {}: {} status={} bodyChars={}", attempt,
                             httpRequest.uri(), response.statusCode(), response.body() == null ? 0 : response.body().length());
                     if (response.statusCode() < 200 || response.statusCode() >= 300) {
                         throw new IllegalStateException("HTTP " + response.statusCode() + ": " + truncate(response.body(), 500));
                     }
                     return settings.stream && supportsStreaming() ? parseStreamingResponse(response.body()) : parseResponse(response.body());
-                });
+                }));
+    }
+
+    private AiResponse withModClassLoader(java.util.function.Supplier<AiResponse> action) {
+        Thread thread = Thread.currentThread();
+        ClassLoader previous = thread.getContextClassLoader();
+        ClassLoader modClassLoader = AbstractJsonAiClient.class.getClassLoader();
+        try {
+            if (modClassLoader != null && previous != modClassLoader) {
+                thread.setContextClassLoader(modClassLoader);
+            }
+            return action.get();
+        } finally {
+            if (thread.getContextClassLoader() != previous) {
+                thread.setContextClassLoader(previous);
+            }
+        }
     }
 
     protected abstract String endpointPath();

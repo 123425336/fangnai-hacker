@@ -29,11 +29,11 @@ public final class ToolSchemaJson {
                 .string("reason", "为什么需要修改。")
                 .string("expectedEffect", "预期效果。")
                 .build()));
-        tools.add(openAiFunction("propose_default_return_transform", "提出一个需要玩家确认后执行的 ASM retransform：按方法返回类型返回默认值，void 直接 return，boolean 返回 false，int 返回 0。", propertyObject()
+        tools.add(openAiFunction("propose_default_return_transform", "提出一个需要玩家确认后执行的 ASM transform：auto_default 安全处理 void、数值和 boolean，但保留对象/数组返回方法，避免把 Iterable、同步数据等必要结果改成 null 导致游戏崩溃；已加载类匹配但修改数为 0 时会从 mods 原始字节码插桩并 redefine。reference_null 仅限玩家明确指定精确方法时使用。", propertyObject()
                 .required("targetPattern", "returnMode", "reason", "expectedEffect")
                 .string("targetPattern", "类名、包名前缀、mod 提示或正则描述。")
                 .string("methodPattern", "可选方法名或正则；留空代表所有支持返回类型的方法。")
-                .string("returnMode", "固定枚举：auto_default、void_return、boolean_false、int_zero。auto_default 会同时处理 void/boolean/int。")
+                .string("returnMode", "固定枚举：auto_default、void_return、boolean_false、int_zero、reference_null。auto_default 处理 void/原始数值/boolean，并保留对象与数组返回；reference_null 风险高，只能用于精确 methodPattern。")
                 .string("reason", "为什么需要修改。")
                 .string("expectedEffect", "预期效果。")
                 .build()));

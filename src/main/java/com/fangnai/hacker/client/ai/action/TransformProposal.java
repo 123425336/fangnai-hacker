@@ -22,7 +22,8 @@ public final class TransformProposal extends ActionProposal {
     public String summary() {
         String method = methodPattern.isBlank() ? "匹配全部支持的方法" : "匹配方法 " + methodPattern;
         return "对目标[" + targetPattern + "]的" + method + "执行默认返回 transform；模式=" + returnMode
-                + "（void return / boolean false / int 0）；原因：" + reason() + "；效果：" + expectedEffect();
+                + "（void return / 数值 0 / boolean false；auto_default 保留对象和数组返回，避免 null 破坏运行时契约）；原因："
+                + reason() + "；效果：" + expectedEffect();
     }
 
     @Override
