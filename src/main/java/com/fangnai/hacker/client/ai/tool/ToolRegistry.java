@@ -280,7 +280,8 @@ public final class ToolRegistry {
 
     public synchronized void showInfo(String id) {
         ensureLoaded();
-        tools.stream().filter(tool -> tool.id.equals(id)).findFirst().ifPresentOrElse(tool -> {
+        ToolMetadata resolved = resolveSavedTool(id);
+        java.util.Optional.ofNullable(resolved).ifPresentOrElse(tool -> {
                     hydrateGeneratedToolMetadata(tool);
                     ChatFeedback.info(tool.id + "：" + tool.purpose + "；能力=" + tool.capability + "；风险=" + tool.riskLevel
                             + "；hash=" + tool.sha256 + (tool.className == null || tool.className.isBlank() ? "" : "；class=" + tool.className)
@@ -293,7 +294,7 @@ public final class ToolRegistry {
 
     public synchronized SavedToolInspection inspectSavedTool(String id, boolean includeSource) {
         ensureLoaded();
-        ToolMetadata tool = tools.stream().filter(candidate -> candidate.id.equals(id)).findFirst().orElse(null);
+        ToolMetadata tool = resolveSavedTool(id);
         if (tool == null) {
             return SavedToolInspection.failure(id, "未找到工具：" + id);
         }
@@ -343,7 +344,7 @@ public final class ToolRegistry {
 
     public synchronized SavedToolExecutionResult executeSavedTool(String id, String input, String actionReason, String actionExpectedEffect) {
         ensureLoaded();
-        ToolMetadata tool = tools.stream().filter(candidate -> candidate.id.equals(id)).findFirst().orElse(null);
+        ToolMetadata tool = resolveSavedTool(id);
         if (tool == null) {
             ChatFeedback.warn("未找到保存工具：" + id);
             return SavedToolExecutionResult.failure(false, "tool_not_found", id, "", methodNameFromInput(input), "", List.of(),
@@ -355,9 +356,72 @@ public final class ToolRegistry {
         if (isGeneratedClassCapability(tool.capability)) {
             return executeSavedDefinedClass(tool, input, actionReason, actionExpectedEffect);
         }
-        ChatFeedback.warn("已找到保存工具 " + id + "，但当前版本只支持重放 define class 工具；transform recipe 仍需让 AI 重新提出具体目标后确认执行。");
-        return SavedToolExecutionResult.failure(false, "unsupported_capability", id, tool.className, methodNameFromInput(input), "", List.of(),
+        ChatFeedback.warn("已找到保存工具 " + tool.id + "，但当前版本只支持重放 define class 工具；transform recipe 仍需让 AI 重新提出具体目标后确认执行。");
+        return SavedToolExecutionResult.failure(false, "unsupported_capability", tool.id, tool.className, methodNameFromInput(input), "", List.of(),
                 "当前只支持执行 generated class 工具，能力=" + tool.capability, "");
+    }
+
+    private ToolMetadata resolveSavedTool(String idOrClassName) {
+        if (idOrClassName == null || idOrClassName.isBlank()) {
+            return null;
+        }
+        String requested = idOrClassName.trim();
+        ToolMetadata byId = tools.stream()
+                .filter(candidate -> candidate.id != null && candidate.id.equals(requested))
+                .findFirst()
+                .orElse(null);
+        if (byId != null) {
+            return byId;
+        }
+        byId = tools.stream()
+                .filter(candidate -> candidate.id != null && candidate.id.equalsIgnoreCase(requested))
+                .findFirst()
+                .orElse(null);
+        if (byId != null) {
+            return byId;
+        }
+
+        String normalizedClassName = requested.replace('/', '.');
+        String generatedId = slug("generated-class-" + normalizedClassName);
+        for (ToolMetadata candidate : tools) {
+            hydrateGeneratedToolMetadata(candidate);
+            if ((candidate.id != null && candidate.id.equalsIgnoreCase(generatedId))
+                    || (candidate.className != null && candidate.className.equals(normalizedClassName))) {
+                return candidate;
+            }
+        }
+        for (ToolMetadata candidate : tools) {
+            if (!isGeneratedClassCapability(candidate.capability)) {
+                continue;
+            }
+            try {
+                String recipeClassName = stringMember(readRecipeObject(candidate), "className");
+                if (recipeClassName.equals(normalizedClassName)) {
+                    return candidate;
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        if (!normalizedClassName.contains(".")) {
+            List<ToolMetadata> simpleNameMatches = tools.stream()
+                    .filter(candidate -> isGeneratedClassCapability(candidate.capability))
+                    .filter(candidate -> candidate.className != null && !candidate.className.isBlank())
+                    .filter(candidate -> simpleClassName(candidate.className).equalsIgnoreCase(normalizedClassName))
+                    .toList();
+            if (simpleNameMatches.size() == 1) {
+                return simpleNameMatches.get(0);
+            }
+            if (simpleNameMatches.size() > 1) {
+                ChatFeedback.warn("保存工具短类名不唯一：" + requested + "；请使用 registry id 或完整 className。候选="
+                        + simpleNameMatches.stream().map(candidate -> candidate.className).sorted().toList());
+            }
+        }
+        return null;
+    }
+
+    private static String simpleClassName(String className) {
+        int separator = className.lastIndexOf('.');
+        return separator >= 0 ? className.substring(separator + 1) : className;
     }
 
     private SavedToolExecutionResult executeSavedDefinedClass(ToolMetadata tool, String input, String actionReason, String actionExpectedEffect) {
