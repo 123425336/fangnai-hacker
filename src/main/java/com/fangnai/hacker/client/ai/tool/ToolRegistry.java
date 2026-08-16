@@ -5,19 +5,21 @@ import com.fangnai.hacker.client.config.HackerClientConfig;
 import com.fangnai.hacker.client.define.ClassDefineService;
 import com.google.gson.Gson;
 import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import net.minecraftforge.fml.loading.FMLPaths;
 
 import java.io.IOException;
 import java.io.Reader;
-import java.io.Writer;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -56,14 +58,37 @@ public final class ToolRegistry {
             Files.createDirectories(root().resolve("classes"));
             Path registry = registryPath();
             if (Files.isRegularFile(registry)) {
-                try (Reader reader = Files.newBufferedReader(registry, StandardCharsets.UTF_8)) {
-                    JsonObject object = JsonParser.parseReader(reader).getAsJsonObject();
-                    JsonArray array = object.has("tools") && object.get("tools").isJsonArray()
-                            ? object.getAsJsonArray("tools") : new JsonArray();
-                    for (var element : array) {
-                        ToolMetadata metadata = gson.fromJson(element, ToolMetadata.class);
-                        if (metadata != null && metadata.id != null && !metadata.id.isBlank()) {
-                            tools.add(hydrateGeneratedToolMetadata(metadata));
+                String raw;
+                try {
+                    raw = Files.readString(registry, StandardCharsets.UTF_8);
+                } catch (IOException e) {
+                    raw = "";
+                }
+                if (raw.isBlank()) {
+                    ChatFeedback.warn("工具目录 registry.json 为空（可能是上次写入时游戏崩溃导致截断）。已备份，正在尝试从 README 快照恢复……");
+                    backupCorruptRegistry("empty");
+                    if (!recoverToolsFromReadme()) {
+                        ChatFeedback.warn("工具目录 README 快照不可用，已重建空索引；recipes/docs/classes 中的原文件未删除。");
+                    }
+                } else {
+                    try (Reader reader = Files.newBufferedReader(registry, StandardCharsets.UTF_8)) {
+                        JsonElement parsed = JsonParser.parseReader(reader);
+                        if (parsed == null || !parsed.isJsonObject()) {
+                            ChatFeedback.warn("工具目录 registry.json 损坏（" + parsed + "）。已备份，正在尝试从 README 快照恢复……");
+                            backupCorruptRegistry("invalid");
+                            if (!recoverToolsFromReadme()) {
+                                ChatFeedback.warn("工具目录 README 快照不可用，已重建空索引；recipes/docs/classes 中的原文件未删除。");
+                            }
+                        } else {
+                            JsonObject object = parsed.getAsJsonObject();
+                            JsonArray array = object.has("tools") && object.get("tools").isJsonArray()
+                                    ? object.getAsJsonArray("tools") : new JsonArray();
+                            for (var element : array) {
+                                ToolMetadata metadata = gson.fromJson(element, ToolMetadata.class);
+                                if (metadata != null && metadata.id != null && !metadata.id.isBlank()) {
+                                    tools.add(hydrateGeneratedToolMetadata(metadata));
+                                }
+                            }
                         }
                     }
                 }
@@ -71,6 +96,112 @@ public final class ToolRegistry {
             writeRegistryAndReadme();
         } catch (Exception e) {
             ChatFeedback.error("工具目录加载失败：" + e.getMessage());
+        }
+    }
+
+    /**
+     * 尝试从 README.md（上次成功写入的目录快照）恢复可执行的 generated-class 工具。
+     * 只恢复带真实 class 文件的 generated class 能力条目，transform 记录不可执行、不恢复。
+     */
+    private boolean recoverToolsFromReadme() {
+        Path readme = root().resolve("README.md");
+        if (!Files.isRegularFile(readme)) {
+            return false;
+        }
+        try {
+            String content = Files.readString(readme, StandardCharsets.UTF_8);
+            String[] sections = content.split("(?m)^## ");
+            int recovered = 0;
+            for (String section : sections) {
+                String[] lines = section.split("\\R");
+                if (lines.length < 2) {
+                    continue;
+                }
+                String id = lines[0].trim();
+                if (id.isBlank() || id.startsWith("# ")) {
+                    continue;
+                }
+                String purpose = readmeField(lines, "Purpose");
+                String capability = readmeField(lines, "Capability");
+                String recipePath = readmeField(lines, "Recipe");
+                if (purpose == null || capability == null || recipePath == null) {
+                    continue;
+                }
+                if (!isGeneratedClassCapability(capability)) {
+                    continue; // transform 记录无法执行，不恢复
+                }
+                String className = readmeField(lines, "Class");
+                if (className == null || className.isBlank()) {
+                    continue;
+                }
+                ToolMetadata metadata = new ToolMetadata();
+                metadata.id = id;
+                metadata.name = "generated class " + className;
+                metadata.purpose = purpose;
+                metadata.capability = capability;
+                metadata.confirmationPolicy = readmeField(lines, "Confirmation");
+                metadata.riskLevel = readmeField(lines, "Risk");
+                metadata.sha256 = readmeField(lines, "SHA-256");
+                metadata.recipePath = recipePath;
+                metadata.docPath = readmeField(lines, "Doc");
+                metadata.className = className;
+                metadata.classSha256 = metadata.sha256;
+                metadata.sourcePath = readmeField(lines, "Source");
+                metadata.runtimeStatus = readmeField(lines, "Runtime");
+                String methodsRaw = readmeField(lines, "Methods");
+                if (methodsRaw != null && !"unknown".equals(methodsRaw)) {
+                    List<String> methods = new ArrayList<>();
+                    for (String method : methodsRaw.split("\\s*,\\s*")) {
+                        if (isSafeMethodName(method)) {
+                            methods.add(method);
+                        }
+                    }
+                    methods.sort(String::compareTo);
+                    metadata.methods = methods;
+                }
+                Path recipe = safeToolPath(recipePath, "recipe");
+                if (!Files.isRegularFile(recipe)) {
+                    ChatFeedback.warn("README 恢复跳过 " + id + "：recipe 不存在 " + recipePath);
+                    continue;
+                }
+                tools.add(hydrateGeneratedToolMetadata(metadata));
+                recovered++;
+            }
+            if (recovered > 0) {
+                ChatFeedback.info("已从 README 快照恢复 " + recovered + " 个保存工具。");
+            }
+            return recovered > 0;
+        } catch (Exception e) {
+            ChatFeedback.error("从 README 恢复工具目录失败：" + e.getMessage());
+            return false;
+        }
+    }
+
+    private static String readmeField(String[] lines, String name) {
+        String prefix = "- " + name + ": ";
+        for (String line : lines) {
+            if (line.startsWith(prefix)) {
+                String value = line.substring(prefix.length()).trim();
+                if (value.length() >= 2 && value.startsWith("`") && value.endsWith("`")) {
+                    value = value.substring(1, value.length() - 1);
+                }
+                return value;
+            }
+        }
+        return null;
+    }
+
+    private void backupCorruptRegistry(String reason) {
+        try {
+            Path registry = registryPath();
+            if (Files.isRegularFile(registry)) {
+                String stamp = Instant.now().toString().replace(':', '-').replace('.', '-').substring(0, 23);
+                Path backup = registry.resolveSibling("registry.json.corrupt-" + stamp + "-" + reason);
+                Files.copy(registry, backup, StandardCopyOption.REPLACE_EXISTING);
+                ChatFeedback.info("损坏的 registry.json 已备份到 " + backup.getFileName());
+            }
+        } catch (Exception e) {
+            ChatFeedback.warn("备份损坏 registry 失败：" + e.getMessage());
         }
     }
 
@@ -746,9 +877,7 @@ public final class ToolRegistry {
                 array.add(gson.toJsonTree(tool));
             }
             rootObject.add("tools", array);
-            try (Writer writer = Files.newBufferedWriter(registryPath(), StandardCharsets.UTF_8)) {
-                gson.toJson(rootObject, writer);
-            }
+            writeTextAtomic(registryPath(), gson.toJson(rootObject));
             StringBuilder readme = new StringBuilder("# Fangnai Hacker Tools\n\n");
             if (tools.isEmpty()) {
                 readme.append("No saved tools yet.\n");
@@ -772,9 +901,20 @@ public final class ToolRegistry {
                             .append("- Doc: `").append(tool.docPath).append("`\n\n");
                 }
             }
-            Files.writeString(root().resolve("README.md"), readme.toString(), StandardCharsets.UTF_8);
+            writeTextAtomic(root().resolve("README.md"), readme.toString());
         } catch (IOException e) {
             ChatFeedback.error("写入工具索引失败：" + e.getMessage());
+        }
+    }
+
+    /** 原子写入：先写临时文件再 move 替换，避免中途崩溃把 registry 截断成空文件。 */
+    private static void writeTextAtomic(Path target, String content) throws IOException {
+        Path tmp = target.resolveSibling(target.getFileName() + ".tmp");
+        Files.writeString(tmp, content, StandardCharsets.UTF_8);
+        try {
+            Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } catch (AtomicMoveNotSupportedException e) {
+            Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
         }
     }
 

@@ -8,8 +8,7 @@ run/
 *.log
 *.jar
 !gradle/wrapper/gradle-wrapper.jar
-# Exclude generated runtime class
-src/main/java/com/fangnai/hacker/client/generated/FangnaiRemove.java
+
 
 .DS_Store
 Thumbs.db
