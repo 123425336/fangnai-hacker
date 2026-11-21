@@ -273,7 +273,7 @@ public class FangnaiAiScreen extends Screen {
 
         renderToast(g);
         if (tooltip != null && !tooltip.isBlank()) {
-            g.renderTooltip(font, font.split(Component.literal(tooltip), 260), mx, my);
+            g.renderTooltip(font, wrap(tooltip, 260), mx, my);
         }
     }
 
@@ -427,24 +427,33 @@ public class FangnaiAiScreen extends Screen {
         int total = 0;
         for (AiChatLog.Entry entry : AiChatLog.get().snapshot()) {
             Block block = new Block(entry);
-            Component text = Component.literal(entry.text());
+            String text = entry.text();
             switch (entry.kind()) {
                 case USER, ASSISTANT -> {
-                    block.lines = font.split(text, bubbleMax);
+                    block.lines = wrap(text, bubbleMax);
                     block.bubbleW = maxWidth(block.lines) + 14;
                     block.height = LABEL_H + block.lines.size() * LINE_H + 7;
                 }
                 case WARN, ERROR -> {
-                    block.lines = font.split(text, wideMax);
+                    block.lines = wrap(text, wideMax);
                     block.bubbleW = listW - 6;
                     block.height = block.lines.size() * LINE_H + 7;
                 }
                 case INFO -> {
-                    block.lines = font.split(text, Math.max(60, listW - 40));
-                    block.height = block.lines.size() * LINE_H - 1;
+                    // 一行能放下就居中显示；多行的系统消息改成左对齐的浅色卡片，方便阅读
+                    List<FormattedCharSequence> single = wrap(text, Math.max(60, listW - 40));
+                    if (single.size() <= 1) {
+                        block.lines = single;
+                        block.height = LINE_H - 1;
+                    } else {
+                        block.boxed = true;
+                        block.lines = wrap(text, wideMax);
+                        block.bubbleW = listW - 6;
+                        block.height = block.lines.size() * LINE_H + 7;
+                    }
                 }
                 case PENDING -> {
-                    List<FormattedCharSequence> all = font.split(text, wideMax);
+                    List<FormattedCharSequence> all = wrap(text, wideMax);
                     block.totalLines = all.size();
                     block.lines = all.size() > PENDING_MAX_LINES ? all.subList(0, PENDING_MAX_LINES) : all;
                     block.bubbleW = listW - 6;
@@ -536,10 +545,14 @@ public class FangnaiAiScreen extends Screen {
                 drawLines(g, block.lines, listX + 8, by + 4, TEXT);
             }
             case INFO -> {
-                int ly = y;
-                for (FormattedCharSequence line : block.lines) {
-                    g.drawString(font, line, listX + (listW - 6 - font.width(line)) / 2, ly, MUTED, false);
-                    ly += LINE_H;
+                if (block.boxed) {
+                    roundRect(g, listX, y, block.bubbleW, block.height, 0x14FFFFFF);
+                    g.fill(listX, y + 2, listX + 2, y + block.height - 2, 0x4000C8FF);
+                    drawLines(g, block.lines, listX + 8, y + 4, MUTED);
+                } else {
+                    for (FormattedCharSequence line : block.lines) {
+                        g.drawString(font, line, listX + (listW - 6 - font.width(line)) / 2, y, MUTED, false);
+                    }
                 }
             }
             case WARN, ERROR -> {
@@ -638,7 +651,7 @@ public class FangnaiAiScreen extends Screen {
         roundRect(g, r.x, r.y, r.w, r.h, focused ? 0x88000000 : 0x66000000);
         roundOutline(g, r.x, r.y, r.w, r.h, focused ? 0xC000C8FF : 0x30FFFFFF);
         if (promptBox.getValue().isEmpty()) {
-            g.drawString(font, ellipsize("和芳乃说点什么…（Enter 发送）", r.w - 14), promptBox.getX(), promptBox.getY(), DIM, false);
+            g.drawString(font, ellipsize("和香草说点什么…（Enter 发送）", r.w - 14), promptBox.getX(), promptBox.getY(), DIM, false);
         }
         fieldHits.add(new Hit(r.x, r.y, r.w, r.h, () -> setFocused(promptBox)));
 
@@ -752,7 +765,7 @@ public class FangnaiAiScreen extends Screen {
             color = WARN;
         }
         if (!message.isBlank()) {
-            List<FormattedCharSequence> lines = font.split(Component.literal(message), cw);
+            List<FormattedCharSequence> lines = wrap(message, cw);
             int sy = rowY(8) + 3;
             for (int i = 0; i < Math.min(2, lines.size()); i++) {
                 g.drawString(font, lines.get(i), cx, sy + i * LINE_H, color, false);
@@ -1161,6 +1174,98 @@ public class FangnaiAiScreen extends Screen {
         g.drawString(font, text, centerX - font.width(text) / 2, y, color, false);
     }
 
+    /**
+     * 中英文混排换行：连续的英文/数字/符号视为一个单词尽量不拆开，
+     * 中文可以在任意两个字之间断行，中文标点不会被挤到行首，超长网址按字符硬切。
+     * （原版换行只在空格处断开，会把整句中文当成一个超长单词，排版很难看。）
+     */
+    private List<FormattedCharSequence> wrap(String text, int maxWidth) {
+        List<FormattedCharSequence> result = new ArrayList<>();
+        for (String line : wrapPlain(text, Math.max(10, maxWidth))) {
+            result.add(FormattedCharSequence.forward(line, Style.EMPTY));
+        }
+        return result;
+    }
+
+    private List<String> wrapPlain(String text, int maxWidth) {
+        List<String> lines = new ArrayList<>();
+        String source = text == null ? "" : text.replace("\r", "").replace("\t", "    ");
+        for (String paragraph : source.split("\n", -1)) {
+            StringBuilder line = new StringBuilder();
+            int lineWidth = 0;
+            boolean wrapped = false;
+            int i = 0;
+            while (i < paragraph.length()) {
+                int end = tokenEnd(paragraph, i);
+                String token = paragraph.substring(i, end);
+                i = end;
+                boolean space = token.isBlank();
+                // 自动换行后的新行不以空格开头
+                if (space && wrapped && line.length() == 0) {
+                    continue;
+                }
+                int tokenWidth = font.width(token);
+                if (lineWidth + tokenWidth > maxWidth && line.length() > 0 && !isClosingPunct(token)) {
+                    lines.add(line.toString().stripTrailing());
+                    line.setLength(0);
+                    lineWidth = 0;
+                    wrapped = true;
+                    if (space) {
+                        continue;
+                    }
+                }
+                if (tokenWidth > maxWidth && !space) {
+                    // 单个“单词”比整行还宽（比如长网址）：逐字符硬切
+                    int k = 0;
+                    while (k < token.length()) {
+                        int next = k + Character.charCount(token.codePointAt(k));
+                        String piece = token.substring(k, next);
+                        int pieceWidth = font.width(piece);
+                        if (lineWidth + pieceWidth > maxWidth && line.length() > 0) {
+                            lines.add(line.toString());
+                            line.setLength(0);
+                            lineWidth = 0;
+                            wrapped = true;
+                        }
+                        line.append(piece);
+                        lineWidth += pieceWidth;
+                        k = next;
+                    }
+                    continue;
+                }
+                line.append(token);
+                lineWidth += tokenWidth;
+            }
+            lines.add(line.toString());
+        }
+        return lines;
+    }
+
+    /** 切出下一个排版单元：英文单词 / 连续空格 / 单个其他字符（中文、全角标点等）。 */
+    private static int tokenEnd(String text, int start) {
+        int codePoint = text.codePointAt(start);
+        int end = start + Character.charCount(codePoint);
+        if (isAsciiWord(codePoint)) {
+            while (end < text.length() && isAsciiWord(text.codePointAt(end))) {
+                end += Character.charCount(text.codePointAt(end));
+            }
+        } else if (codePoint == ' ') {
+            while (end < text.length() && text.charAt(end) == ' ') {
+                end++;
+            }
+        }
+        return end;
+    }
+
+    private static boolean isAsciiWord(int codePoint) {
+        return codePoint > 32 && codePoint < 127;
+    }
+
+    /** 不能出现在行首的中文标点：允许它稍微超出行宽，跟在上一个字后面。 */
+    private static boolean isClosingPunct(String token) {
+        return token.length() == 1 && "，。、；：！？）》」』】…".indexOf(token.charAt(0)) >= 0;
+    }
+
     private int maxWidth(List<FormattedCharSequence> lines) {
         int max = 0;
         for (FormattedCharSequence line : lines) {
@@ -1373,6 +1478,8 @@ public class FangnaiAiScreen extends Screen {
         private int height;
         private int bubbleW;
         private int totalLines;
+        /** 多行系统消息是否以卡片形式显示。 */
+        private boolean boxed;
         private int y;
 
         private Block(AiChatLog.Entry entry) {

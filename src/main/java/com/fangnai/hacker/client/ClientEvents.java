@@ -8,6 +8,7 @@ import com.fangnai.hacker.client.input.ModKeyMappings;
 import com.fangnai.hacker.client.render.EntityBoxRenderer;
 import com.fangnai.hacker.client.render.GlassHudRenderer;
 import com.fangnai.hacker.client.render.KillAreaHudRenderer;
+import com.fangnai.hacker.client.screen.FangnaiAiScreen;
 import com.fangnai.hacker.client.screen.HackerSettingsScreen;
 import com.fangnai.hacker.client.target.EntityBoxPicker;
 import net.minecraft.client.Minecraft;
@@ -15,6 +16,7 @@ import net.minecraft.world.entity.Entity;
 import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.client.event.RenderGuiOverlayEvent;
 import net.minecraftforge.client.event.RenderLevelStageEvent;
+import net.minecraftforge.client.gui.overlay.VanillaGuiOverlay;
 import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
 import net.minecraftforge.fml.common.Mod;
@@ -71,6 +73,15 @@ public final class ClientEvents {
 
         targetedEntity = EntityBoxPicker.pick(minecraft, PICK_DISTANCE);
         EntityBoxRenderer.render(event.getPoseStack(), event.getCamera(), targetedEntity);
+    }
+
+    /** AI 对话界面打开时隐藏原版聊天栏：消息已经显示在界面里，避免文字透过半透明面板。 */
+    @SubscribeEvent
+    public static void onRenderGuiOverlayPre(RenderGuiOverlayEvent.Pre event) {
+        if (Minecraft.getInstance().screen instanceof FangnaiAiScreen
+                && VanillaGuiOverlay.CHAT_PANEL.id().equals(event.getOverlay().id())) {
+            event.setCanceled(true);
+        }
     }
 
     @SubscribeEvent
