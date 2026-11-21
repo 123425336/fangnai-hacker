@@ -52,8 +52,11 @@ public final class ClassDefineService {
 
     public void define(String className, String base64ClassBytes, String expectedSha256, String reason, String expectedEffect) {
         try {
-            byte[] bytes = Base64.getDecoder().decode((base64ClassBytes == null ? "" : base64ClassBytes).replaceAll("\\s+", ""));
-            DefineInput input = validateClassBytes(className, bytes, expectedSha256);
+            byte[] rawBytes = Base64.getDecoder().decode((base64ClassBytes == null ? "" : base64ClassBytes).replaceAll("\\s+", ""));
+            // 先按原始字节校验 sha256，再把开发期方法名/字段名改写成运行期名称
+            validateClassBytes(className, rawBytes, expectedSha256);
+            byte[] bytes = RuntimeNameMapper.get().toRuntimeNamesIfNeeded(rawBytes);
+            DefineInput input = validateClassBytes(className, bytes, "");
             DefineOutcome outcome = defineOrRedefineValidated(input);
             Path classFile = saveClass(input, reason, expectedEffect, outcome);
             ToolRegistry.get().recordDefinedClass(input.className(), classFile, input.sha256(), reason, expectedEffect, outcome.runtimeStatus());
@@ -100,6 +103,8 @@ public final class ClassDefineService {
                         "Java 源码编译结束但未找到目标 class 文件：" + compiledClass,
                         compileResult.diagnostics(), sourcePath, diagnosticsPath, null, "compile_missing_class");
             }
+            // 源码里用的是开发期名称，define 前改写成正式环境的运行期名称
+            RuntimeNameMapper.get().remapCompiledDirectory(compiledDir);
             List<DefineInput> inputs = compiledClassInputs(compiledDir, normalizedClassName);
             DefineBatchOutcome batchOutcome = defineOrRedefineValidatedBatch(inputs, normalizedClassName);
             DefineInput primaryInput = batchOutcome.primaryInput();
@@ -148,6 +153,8 @@ public final class ClassDefineService {
                         "Java 源码预编译结束但未找到目标 class 文件：" + compiledClass,
                         compileResult.diagnostics(), sourcePath, diagnosticsPath);
             }
+            // 预编译也走一遍名称改写，提前暴露映射问题
+            RuntimeNameMapper.get().remapCompiledDirectory(compiledDir);
             byte[] bytes = Files.readAllBytes(compiledClass);
             validateClassBytes(normalizedClassName, bytes, "");
             return new CompileCheckResult(true, false, normalizedClassName,
@@ -222,11 +229,18 @@ public final class ClassDefineService {
             options.add("UTF-8");
             options.add("-proc:none");
             options.add("-classpath");
-            options.add(System.getProperty("java.class.path", ""));
+            // 正式环境的启动 classpath 里没有游戏本体，这里换成“开发期名称存根 + 已加载模组 + 依赖库”
+            options.add(RuntimeNameMapper.get().compileClasspath());
             Callable<Boolean> callable = () -> compiler.getTask(null, fileManager, diagnostics, options, null, sources).call();
             Future<Boolean> future = executor.submit(callable);
             boolean success = future.get(HackerClientConfig.ai().compileDefineTimeoutSeconds, TimeUnit.SECONDS);
-            return new CompileResult(success, diagnosticsToString(diagnostics));
+            String text = diagnosticsToString(diagnostics);
+            String mappingError = RuntimeNameMapper.get().lastError();
+            if (!success && !mappingError.isBlank()) {
+                // 映射准备失败时把原因附在诊断最前面，方便定位
+                text = "NOTE: 游戏类名称映射不可用，编译 classpath 中缺少游戏本体：" + mappingError + System.lineSeparator() + text;
+            }
+            return new CompileResult(success, text);
         } catch (java.util.concurrent.TimeoutException timeout) {
             throw new IllegalStateException("Java 源码编译超时（" + HackerClientConfig.ai().compileDefineTimeoutSeconds + "s）。");
         } finally {

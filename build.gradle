@@ -75,6 +75,7 @@ dependencies {
     annotationProcessor 'org.spongepowered:mixin:0.8.5:processor'
     compileOnly 'org.ow2.asm:asm:9.5'
     compileOnly 'org.ow2.asm:asm-tree:9.5'
+    compileOnly 'org.ow2.asm:asm-commons:9.5'
 }
 
 tasks.register('agentJar', Jar) {

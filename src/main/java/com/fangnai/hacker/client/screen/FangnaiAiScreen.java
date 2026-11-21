@@ -34,7 +34,7 @@ import java.util.concurrent.CompletionException;
 import java.util.function.Consumer;
 
 /**
- * 芳乃 AI 对话界面（/fangnaigui 打开）。
+ * 香草 AI 对话界面（/fangnaigui 打开）。
  * 对话页：气泡式消息列表 + 待确认操作卡片 + 快捷指令 + 输入框；
  * 设置页：直接编辑接口地址、密钥、模型等，并可实时预览最终请求地址、测试连接。
  */
@@ -61,6 +61,10 @@ public class FangnaiAiScreen extends Screen {
     private static final int LABEL_H = 11;
     private static final int PENDING_MAX_LINES = 6;
     private static final int SETTING_ROWS = 9;
+
+    /** 界面里显示的助手名字与徽章文字。 */
+    private static final String ASSISTANT_NAME = "香草";
+    private static final String BADGE = "香";
 
     private static final DateTimeFormatter TIME = DateTimeFormatter.ofPattern("HH:mm").withZone(ZoneId.systemDefault());
 
@@ -95,6 +99,11 @@ public class FangnaiAiScreen extends Screen {
     private double scroll;
     private boolean followBottom = true;
     private int lastMaxScroll;
+    private int lastViewH;
+    private int thumbY, thumbH;
+    /** 拖动消息内容翻页 / 拖动滚动条滑块。 */
+    private boolean draggingList, draggingScrollbar;
+    private double dragStartY, dragStartScroll;
     private int contentHeight;
     private long layoutVersion = -1L;
     private int layoutWidth = -1;
@@ -126,7 +135,7 @@ public class FangnaiAiScreen extends Screen {
     private long toastUntil;
 
     public FangnaiAiScreen() {
-        super(Component.literal("芳乃 AI 助手"));
+        super(Component.literal(ASSISTANT_NAME + "助手"));
         // 打开界面时顺便检查配置文件是否被手动改过
         if (HackerClientConfig.reloadIfChangedOnDisk()) {
             setStatus("检测到配置文件被修改，已自动重新加载。", OK);
@@ -293,7 +302,7 @@ public class FangnaiAiScreen extends Screen {
         int bx = px + PAD;
         int by = py + 6;
         roundGradient(g, bx, by, 15, 15, ACCENT, PINK);
-        g.drawString(font, "芳", bx + (15 - font.width("芳")) / 2, by + 4, 0xFFFFFFFF, false);
+        g.drawString(font, BADGE, bx + (15 - font.width(BADGE)) / 2, by + 4, 0xFFFFFFFF, false);
 
         // 右侧：关闭按钮
         int closeX = px + pw - PAD - 14;
@@ -324,7 +333,7 @@ public class FangnaiAiScreen extends Screen {
         // 标题与副标题（模型 · 主机）
         int titleX = bx + 21;
         int titleMax = pillX - 6 - titleX;
-        g.drawString(font, ellipsize("芳乃 AI 助手", titleMax), titleX, py + 5, TEXT, false);
+        g.drawString(font, ellipsize(ASSISTANT_NAME + "助手", titleMax), titleX, py + 5, TEXT, false);
         HackerClientConfig.AiSettings ai = HackerClientConfig.ai();
         String sub = (ai.model.isBlank() ? "未设置模型" : ai.model) + " · " + hostOf(AiClientFactory.resolveEndpoint(ai));
         g.pose().pushPose();
@@ -475,6 +484,7 @@ public class FangnaiAiScreen extends Screen {
         int total = contentHeight + thinkingH;
         int maxScroll = Math.max(0, total - viewH);
         lastMaxScroll = maxScroll;
+        lastViewH = viewH;
         if (followBottom) {
             scroll = maxScroll;
         }
@@ -500,10 +510,12 @@ public class FangnaiAiScreen extends Screen {
         // 滚动条
         if (maxScroll > 0 && viewH > 0) {
             int trackX = listX + listW - 3;
-            int thumbH = Math.max(16, viewH * viewH / Math.max(1, total));
-            int thumbY = listTop + (int) ((viewH - thumbH) * (scroll / maxScroll));
-            g.fill(trackX, listTop, trackX + 2, listBottom, 0x14FFFFFF);
-            g.fill(trackX, thumbY, trackX + 2, thumbY + thumbH, 0x66FFFFFF);
+            thumbH = Math.min(viewH, Math.max(16, viewH * viewH / Math.max(1, total)));
+            thumbY = listTop + (int) ((viewH - thumbH) * (scroll / maxScroll));
+            boolean barHover = mx >= listX + listW - 8 && mx <= listX + listW && my >= listTop && my <= listBottom;
+            boolean active = draggingScrollbar || draggingList || barHover;
+            g.fill(trackX, listTop, trackX + 2, listBottom, active ? 0x22FFFFFF : 0x14FFFFFF);
+            g.fill(trackX - (active ? 1 : 0), thumbY, trackX + 2, thumbY + thumbH, active ? 0xC000C8FF : 0x66FFFFFF);
         }
         // 翻到上面时显示“回到最新”
         if (!followBottom && maxScroll - scroll > 24) {
@@ -517,8 +529,8 @@ public class FangnaiAiScreen extends Screen {
         int midX = listX + listW / 2;
         int top = listTop + Math.max(4, viewH / 2 - 34);
         roundGradient(g, midX - 12, top, 24, 24, ACCENT, PINK);
-        g.drawString(font, "芳", midX - font.width("芳") / 2, top + 8, 0xFFFFFFFF, false);
-        drawCentered(g, "嗨～我是芳乃 AI，有什么想让我做的吗？", midX, top + 32, TEXT);
+        g.drawString(font, BADGE, midX - font.width(BADGE) / 2, top + 8, 0xFFFFFFFF, false);
+        drawCentered(g, "嗨～我是" + ASSISTANT_NAME + "，有什么想让我做的吗？", midX, top + 32, TEXT);
         drawCentered(g, "在下方输入后按 Enter 发送，也可以点快捷指令", midX, top + 45, MUTED);
         drawCentered(g, "↑/↓ 翻历史 · 右键消息复制 · ESC 关闭", midX, top + 57, DIM);
     }
@@ -536,8 +548,8 @@ public class FangnaiAiScreen extends Screen {
                 drawLines(g, block.lines, bx + 7, by + 4, 0xFFFFFFFF);
             }
             case ASSISTANT -> {
-                g.drawString(font, "芳乃 AI", listX + 1, y, PINK, false);
-                g.drawString(font, time(entry), listX + 6 + font.width("芳乃 AI"), y, DIM, false);
+                g.drawString(font, ASSISTANT_NAME, listX + 1, y, PINK, false);
+                g.drawString(font, time(entry), listX + 6 + font.width(ASSISTANT_NAME), y, DIM, false);
                 int by = y + LABEL_H;
                 int bh = block.height - LABEL_H;
                 roundRect(g, listX, by, block.bubbleW, bh, 0xD81B2434);
@@ -610,7 +622,7 @@ public class FangnaiAiScreen extends Screen {
             text = "工作流处理中" + ".".repeat((int) (Util.getMillis() / 350L % 4L));
             color = TEXT;
         }
-        g.drawString(font, "芳乃 AI", listX + 1, y, PINK, false);
+        g.drawString(font, ASSISTANT_NAME, listX + 1, y, PINK, false);
         int by = y + LABEL_H;
         int w = Math.max(80, font.width(text) + 16);
         roundRect(g, listX, by, w, 17, 0xD81B2434);
@@ -837,6 +849,22 @@ public class FangnaiAiScreen extends Screen {
                 }
             }
         }
+        // 对话页左键按住消息区：开始拖动翻页；按在右侧滚动条上：拖动滑块
+        if (button == 0 && tab == Tab.CHAT && inList(mx, my)) {
+            if (lastMaxScroll > 0 && mx >= listX + listW - 8) {
+                draggingScrollbar = true;
+                // 点在滑块外面时，先让滑块中心跳到鼠标位置
+                if (my < thumbY || my > thumbY + thumbH) {
+                    scrollToThumbTop(my - thumbH / 2.0D);
+                }
+            } else {
+                draggingList = true;
+            }
+            dragStartY = my;
+            dragStartScroll = scroll;
+            followBottom = false;
+            return true;
+        }
         if (super.mouseClicked(mx, my, button)) {
             return true;
         }
@@ -857,6 +885,47 @@ public class FangnaiAiScreen extends Screen {
             }
         }
         return false;
+    }
+
+    @Override
+    public boolean mouseDragged(double mx, double my, int button, double dragX, double dragY) {
+        if (draggingScrollbar) {
+            // 滑块移动距离按比例换算成内容滚动距离
+            double track = Math.max(1, lastViewH - thumbH);
+            setScroll(dragStartScroll + (my - dragStartY) * lastMaxScroll / track);
+            return true;
+        }
+        if (draggingList) {
+            // 往上拖看下面的消息，往下拖看上面的消息（跟手机上滑动一致）
+            setScroll(dragStartScroll - (my - dragStartY));
+            return true;
+        }
+        return super.mouseDragged(mx, my, button, dragX, dragY);
+    }
+
+    @Override
+    public boolean mouseReleased(double mx, double my, int button) {
+        if (draggingList || draggingScrollbar) {
+            draggingList = false;
+            draggingScrollbar = false;
+            followBottom = scroll >= lastMaxScroll - 1;
+            return true;
+        }
+        return super.mouseReleased(mx, my, button);
+    }
+
+    private void setScroll(double value) {
+        scroll = Mth.clamp(value, 0.0D, lastMaxScroll);
+        followBottom = false;
+    }
+
+    private void scrollToThumbTop(double thumbTop) {
+        double track = Math.max(1, lastViewH - thumbH);
+        setScroll((thumbTop - listTop) / track * lastMaxScroll);
+    }
+
+    private boolean inList(double mx, double my) {
+        return mx >= listX && mx <= listX + listW && my >= listTop && my <= listBottom;
     }
 
     @Override
