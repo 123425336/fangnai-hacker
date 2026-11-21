@@ -227,6 +227,15 @@ public final class HackerClientConfig {
         if (!aiRaw.has("confirmClassDefine")) {
             loaded.ai.confirmClassDefine = defaults.ai.confirmClassDefine;
         }
+        if (!aiRaw.has("autoRunAfterDefine")) {
+            loaded.ai.autoRunAfterDefine = defaults.ai.autoRunAfterDefine;
+        }
+        if (!aiRaw.has("autoRunMaxRounds")) {
+            loaded.ai.autoRunMaxRounds = defaults.ai.autoRunMaxRounds;
+        }
+        if (!aiRaw.has("autoRunObserveMillis")) {
+            loaded.ai.autoRunObserveMillis = defaults.ai.autoRunObserveMillis;
+        }
         if (!aiRaw.has("classDefineMaxBytes")) {
             loaded.ai.classDefineMaxBytes = defaults.ai.classDefineMaxBytes;
         }
@@ -338,6 +347,12 @@ public final class HackerClientConfig {
         public int jarAnalysisWorkflowMaxCompileRepairAttempts = 5;
         public int jarAnalysisWorkflowResultPreviewChars = 8000;
         public int jarAnalysisWorkflowPromptMaxChars = 24000;
+        /** 确认 define / 执行工具后自动执行，并把结果交给 AI 判断、没达成目标就自动修复。 */
+        public boolean autoRunAfterDefine = true;
+        /** 一次自动流程最多自动执行多少轮，用完先暂停等玩家说继续；0 表示不限制。 */
+        public int autoRunMaxRounds = 10;
+        /** 执行工具后继续收集聊天栏输出的时间（毫秒），用来捕获工具在服务端线程异步打印的结果。 */
+        public int autoRunObserveMillis = 2500;
         public int classDefineMaxBytes = 262144;
         public String classDefineAllowedPackage = "com.fangnai.hacker.generated";
         public int compileDefineTimeoutSeconds = 30;
@@ -371,6 +386,8 @@ public final class HackerClientConfig {
             jarAnalysisWorkflowMaxCompileRepairAttempts = Mth.clamp(jarAnalysisWorkflowMaxCompileRepairAttempts, 0, 20);
             jarAnalysisWorkflowResultPreviewChars = Mth.clamp(jarAnalysisWorkflowResultPreviewChars, 1024, 65536);
             jarAnalysisWorkflowPromptMaxChars = Mth.clamp(jarAnalysisWorkflowPromptMaxChars, 4096, 131072);
+            autoRunMaxRounds = Mth.clamp(autoRunMaxRounds, 0, 100);
+            autoRunObserveMillis = Mth.clamp(autoRunObserveMillis, 0, 30000);
             classDefineMaxBytes = Mth.clamp(classDefineMaxBytes, 1024, 1048576);
             compileDefineTimeoutSeconds = Mth.clamp(compileDefineTimeoutSeconds, 5, 120);
             generatedSourceMaxChars = Mth.clamp(generatedSourceMaxChars, 1024, 262144);

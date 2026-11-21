@@ -80,6 +80,7 @@ public final class ToolSchemaJson {
                 .string("className", "完整类名；必须精确位于 com.fangnai.hacker.generated 包，如 com.fangnai.hacker.generated.MyTool。修改旧工具时复用同名 className，不要加 V2/V3/Fixed/New 后缀。")
                 .string("javaSource", "完整 Java 源码；必须声明 package com.fangnai.hacker.generated; 并包含匹配的顶层类型。已加载同名类要 live redefine 时，只改方法体，不要新增/删除字段方法或修改签名。")
                 .string("sourceSha256", "可选：Java 源码 UTF-8 内容 SHA-256。")
+                .string("runMethod", "define 成功后自动执行的 public static 无参方法名（如 run）；执行结果会自动交还给你判断是否达成目标。")
                 .string("reason", "为什么需要编译并 define/redefine 这个类。")
                 .string("expectedEffect", "预期效果。")
                 .build()));

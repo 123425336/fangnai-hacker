@@ -600,7 +600,7 @@ public final class ToolRegistry {
             String message = "执行保存 define class 工具失败：" + root.getClass().getSimpleName() + ": " + root.getMessage();
             ChatFeedback.error(message);
             return SavedToolExecutionResult.failure(true, "class_load_failed", tool.id, className, requestedMethod, "", tool.methods,
-                    message, root.getClass().getSimpleName());
+                    message, root.getClass().getName(), describeThrowable(root));
         }
     }
 
@@ -618,20 +618,42 @@ public final class ToolRegistry {
             }
             validateSavedToolMethod(loadedClass, method);
             Object result = method.invoke(null);
+            boolean hasReturn = !Void.TYPE.equals(method.getReturnType());
             String message = "已执行保存工具方法：" + loadedClass.getName() + "." + methodName + "()"
-                    + (Void.TYPE.equals(method.getReturnType()) ? "" : "；返回=" + result);
+                    + (hasReturn ? "；返回=" + result : "");
             ChatFeedback.info(message);
             return new SavedToolExecutionResult(true, false, "success", tool.id, loadedClass.getName(), requestedMethod,
-                    methodName, supported, message, "");
+                    methodName, supported, message, "", hasReturn ? String.valueOf(result) : "(void)", "");
         } catch (Throwable e) {
             Throwable root = rootCause(e);
             String status = root instanceof SecurityException ? "method_not_allowed" : "invoke_failed";
             String message = "执行保存工具方法失败：" + loadedClass.getName() + "." + methodName + "()；"
                     + root.getClass().getSimpleName() + ": " + root.getMessage();
             ChatFeedback.error(message);
+            // 带上完整异常链和堆栈，AI 才能看出是哪一行、哪个成员出了问题
             return SavedToolExecutionResult.failure(true, status, tool.id, loadedClass.getName(), requestedMethod, methodName,
-                    supported, message, root.getClass().getSimpleName());
+                    supported, message, root.getClass().getName(), describeThrowable(root));
         }
+    }
+
+    /** 把异常链（含 Caused by）格式化成文本交给 AI 分析；限制行数，避免 prompt 过长。 */
+    private static String describeThrowable(Throwable throwable) {
+        if (throwable == null) {
+            return "";
+        }
+        java.io.StringWriter writer = new java.io.StringWriter();
+        throwable.printStackTrace(new java.io.PrintWriter(writer));
+        String[] lines = writer.toString().split("\\R");
+        StringBuilder builder = new StringBuilder();
+        int max = 60;
+        for (int i = 0; i < lines.length; i++) {
+            if (i >= max) {
+                builder.append("...（堆栈共 ").append(lines.length).append(" 行，只保留前 ").append(max).append(" 行）\n");
+                break;
+            }
+            builder.append(lines[i]).append('\n');
+        }
+        return builder.toString();
     }
 
     private static Throwable rootCause(Throwable throwable) {
@@ -935,9 +957,14 @@ public final class ToolRegistry {
         return slug.isBlank() ? "tool" : slug.substring(0, Math.min(slug.length(), 80));
     }
 
+    /**
+     * 保存工具的执行结果。returnValue 是方法返回值的文本（void 方法为 "(void)"），
+     * errorDetail 是失败时的完整异常链和堆栈。
+     */
     public record SavedToolExecutionResult(boolean success, boolean recoverable, String status, String toolId,
                                            String className, String requestedMethod, String invokedMethod,
-                                           List<String> supportedMethods, String message, String errorClass) {
+                                           List<String> supportedMethods, String message, String errorClass,
+                                           String returnValue, String errorDetail) {
         public SavedToolExecutionResult {
             status = status == null ? "unknown" : status;
             toolId = toolId == null ? "" : toolId;
@@ -947,13 +974,22 @@ public final class ToolRegistry {
             supportedMethods = supportedMethods == null ? List.of() : List.copyOf(supportedMethods);
             message = message == null ? "" : message;
             errorClass = errorClass == null ? "" : errorClass;
+            returnValue = returnValue == null ? "" : returnValue;
+            errorDetail = errorDetail == null ? "" : errorDetail;
         }
 
         private static SavedToolExecutionResult failure(boolean recoverable, String status, String toolId, String className,
                                                         String requestedMethod, String invokedMethod, List<String> supportedMethods,
                                                         String message, String errorClass) {
+            return failure(recoverable, status, toolId, className, requestedMethod, invokedMethod, supportedMethods,
+                    message, errorClass, "");
+        }
+
+        private static SavedToolExecutionResult failure(boolean recoverable, String status, String toolId, String className,
+                                                        String requestedMethod, String invokedMethod, List<String> supportedMethods,
+                                                        String message, String errorClass, String errorDetail) {
             return new SavedToolExecutionResult(false, recoverable, status, toolId, className, requestedMethod,
-                    invokedMethod, supportedMethods, message, errorClass);
+                    invokedMethod, supportedMethods, message, errorClass, "", errorDetail);
         }
     }
 

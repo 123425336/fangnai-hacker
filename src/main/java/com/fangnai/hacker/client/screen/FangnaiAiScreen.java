@@ -373,6 +373,9 @@ public class FangnaiAiScreen extends Screen {
         if (manager.isRequesting()) {
             return new StatusPill("思考中 " + manager.requestElapsedMillis() / 1000L + "s", ACCENT, true);
         }
+        if (status.startsWith("workflow:running")) {
+            return new StatusPill("执行中", PINK, true);
+        }
         if (status.startsWith("workflow")) {
             return new StatusPill("工作流", PINK, true);
         }

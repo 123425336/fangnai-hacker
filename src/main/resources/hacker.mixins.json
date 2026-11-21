@@ -5,6 +5,7 @@
   "compatibilityLevel": "JAVA_17",
   "refmap": "hacker.refmap.json",
   "client": [
+    "MixinChatComponent",
     "MixinClientPacketListener",
     "MixinMinecraft",
     "MixinScreen"

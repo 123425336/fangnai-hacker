@@ -169,6 +169,7 @@ public abstract class ActionProposal {
                     string(args, "className"),
                     string(args, "javaSource"),
                     string(args, "sourceSha256"),
+                    string(args, "runMethod"),
                     string(args, "reason"),
                     string(args, "expectedEffect")
             );
@@ -245,6 +246,7 @@ public abstract class ActionProposal {
                         string(object, "className"),
                         string(object, "javaSource"),
                         string(object, "sourceSha256"),
+                        string(object, "runMethod"),
                         string(object, "reason"),
                         string(object, "expectedEffect")
                 );

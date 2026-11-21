@@ -318,6 +318,19 @@ public final class ClassDefineService {
     }
 
     private DefineOutcome defineOrRedefineValidated(DefineInput input) throws IllegalAccessException {
+        DefineOutcome inPlace = defineOrRedefineInPlace(input);
+        if (inPlace != null) {
+            return inPlace;
+        }
+        // 使用隔离 ClassLoader define 新版本；旧版 Class 对象在所有引用解除后会被 GC
+        return defineWithIsolatedLoader(List.of(input)).get(input.className());
+    }
+
+    /**
+     * 尝试在原 ClassLoader 里 define 新类或 live redefine 已加载的类。
+     * 类结构变化（新增/删除字段方法）导致无法原地更新时返回 null，由调用方改用隔离 ClassLoader。
+     */
+    private DefineOutcome defineOrRedefineInPlace(DefineInput input) throws IllegalAccessException {
         Class<?> existing = findLoadedGeneratedClass(input.className());
         if (existing == null) {
             Class<?> defined = defineValidated(input);
@@ -338,28 +351,36 @@ public final class ClassDefineService {
                         + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
             }
         }
-
-        // 使用隔离 ClassLoader define 新版本
-        // 旧版 Class 对象在所有引用解除后会被 GC
-        return defineWithIsolatedLoader(input);
+        return null;
     }
 
-    private synchronized DefineOutcome defineWithIsolatedLoader(DefineInput input) {
+    /**
+     * 用一个新的隔离 ClassLoader 一次性加载同一批类。
+     * 主类和它的内部类必须在同一个加载器里才能互相找到，所以整批共用一个加载器。
+     */
+    private synchronized Map<String, DefineOutcome> defineWithIsolatedLoader(List<DefineInput> inputs) {
         String allowedPackage = HackerClientConfig.ai().classDefineAllowedPackage;
         IsolatedGeneratedClassLoader loader = new IsolatedGeneratedClassLoader(
                 GeneratedClassAnchor.class.getClassLoader(), allowedPackage);
+        Map<String, DefineOutcome> outcomes = new LinkedHashMap<>();
+        String oldLoaderInfo = lastIsolatedLoader != null ? "，旧 loader=" + lastIsolatedLoader.toShortString() : "";
         try {
-            Class<?> defined = loader.defineIsolatedClass(input.className(), input.bytes());
-            String oldLoaderInfo = lastIsolatedLoader != null ? "，旧 loader=" + lastIsolatedLoader.toShortString() : "";
+            for (DefineInput input : inputs) {
+                Class<?> defined = loader.defineIsolatedClass(input.className(), input.bytes());
+                outcomes.put(input.className(), new DefineOutcome(defined, DefineStatus.REDEFINED_ISOLATED,
+                        "已用新隔离 ClassLoader 加载新版本" + oldLoaderInfo
+                                + "；旧版 Class 对象在解除所有引用后将被 GC；loader=" + loader.toShortString()
+                                + "。注意：持有旧版 Class 引用的代码（如反射缓存）需要更新到新版。"));
+            }
             lastIsolatedLoader = loader;
-            return new DefineOutcome(defined, DefineStatus.REDEFINED_ISOLATED,
-                    "已用新隔离 ClassLoader 加载新版本" + oldLoaderInfo
-                            + "；旧版 Class 对象在解除所有引用后将被 GC；loader=" + loader.toShortString()
-                            + "。注意：持有旧版 Class 引用的代码（如反射缓存）需要更新到新版。");
-        } catch (Exception e) {
-            return restartRequired(findLoadedGeneratedClass(input.className()),
-                    "隔离 ClassLoader define 失败：" + e.getClass().getSimpleName() + ": " + e.getMessage());
+        } catch (Exception | LinkageError e) {
+            outcomes.clear();
+            for (DefineInput input : inputs) {
+                outcomes.put(input.className(), restartRequired(findLoadedGeneratedClass(input.className()),
+                        "隔离 ClassLoader define 失败：" + e.getClass().getSimpleName() + ": " + e.getMessage()));
+            }
         }
+        return outcomes;
     }
 
     private DefineBatchOutcome defineOrRedefineValidatedBatch(List<DefineInput> inputs, String primaryClassName) throws IllegalAccessException {
@@ -369,15 +390,27 @@ public final class ClassDefineService {
         DefineInput primaryInput = null;
         List<DefineInput> ordered = new ArrayList<>(inputs);
         ordered.sort(Comparator.comparingInt(input -> dependencyOrder(input.className(), primaryClassName)));
-        Map<String, DefineOutcome> outcomes = new LinkedHashMap<>();
         for (DefineInput input : ordered) {
             if (input.className().equals(primaryClassName)) {
                 primaryInput = input;
             }
-            outcomes.put(input.className(), defineOrRedefineValidated(input));
         }
         if (primaryInput == null) {
             throw new IllegalArgumentException("编译产物中缺少主类：" + primaryClassName);
+        }
+        Map<String, DefineOutcome> outcomes = new LinkedHashMap<>();
+        boolean needsIsolation = false;
+        for (DefineInput input : ordered) {
+            DefineOutcome outcome = defineOrRedefineInPlace(input);
+            if (outcome == null) {
+                needsIsolation = true;
+                break;
+            }
+            outcomes.put(input.className(), outcome);
+        }
+        if (needsIsolation) {
+            // 只要有一个类无法原地更新，就把整批类放进同一个新的隔离加载器，保证主类能找到新版内部类
+            outcomes = defineWithIsolatedLoader(ordered);
         }
         return new DefineBatchOutcome(primaryInput, outcomes.get(primaryInput.className()), outcomes);
     }

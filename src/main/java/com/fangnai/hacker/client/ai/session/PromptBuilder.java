@@ -19,6 +19,14 @@ public final class PromptBuilder {
         prompt.append("retransform 默认返回工具：优先用 propose_default_return_transform；returnMode=auto_default 会让 void 直接 return、boolean 返回 false、原始数值返回 0，但保留对象/数组返回方法，避免必要返回值变成 null 导致崩溃。只想处理某类返回值时使用 void_return/boolean_false/int_zero；reference_null 仅在玩家明确要求且提供精确 methodPattern 时使用，禁止对整类引用返回统一置 null。\n");
         prompt.append("jar 分析/反编译只能通过 propose_jar_analysis 提出：mode 仅允许 list_jars、list_entries、manifest、find_class、javap_class；只能分析游戏 mods 目录下 jar；不要提出任意 shell 命令，不要声称未确认的分析已经执行。\n");
         prompt.append("确认一次 jar_analysis 后，系统可能进入有界自动工作流：每轮你只能提出一个下一步，要么 propose_jar_analysis 做定向补充分析，要么信息足够后 propose_compile_define_java_class 给完整 Java 源码，要么说明无法继续。不要在工作流中提出无关工具；生成类必须在 com.fangnai.hacker.generated 包；修复必须复用同一个 className，不要 V2/V3/New 后缀。\n");
+        if (settings.autoRunAfterDefine) {
+            prompt.append("自动执行与自修复：玩家确认 propose_compile_define_java_class 或 execute_saved_tool 后会进入自动流程。define 成功后系统会自动执行工具（用 runMethod 参数指定 public static 无参方法），"
+                    + "然后把返回值、异常堆栈、执行后几秒内的聊天栏输出和当前源码交还给你。你要据此判断是否真正达成目标：达成就以“目标已达成：”开头说明证据；"
+                    + "没达成就继续 propose_jar_analysis 定向分析，或 propose_compile_define_java_class 给出修复版（同一个 className），系统会自动 define 并再次执行，不需要玩家逐个确认。\n");
+            prompt.append("为了让自动判断可靠，工具方法必须返回能证明结果的 String：找到几个目标、改前改后的值、失败时的 e.toString() 和关键上下文。"
+                    + "不要吞掉异常只返回异常的简单类名；单人游戏里改服务端实体时用 server.submit(() -> ...).get(5, TimeUnit.SECONDS) 同步拿到结果再返回，不要 execute 之后立刻返回“已排队”；"
+                    + "反射找不到方法/字段时，把该类及其父类实际声明的成员（名称+参数类型）写进返回值，运行时的类结构可能被改写过，和 jar 里看到的不一定一样。\n");
+        }
         prompt.append("动态 define class：普通现写类需求优先通过 propose_compile_define_java_class 提出 Java 源码；本地会先保存源码、执行 javac 语法/编译验证、再校验 class bytes 后 define/redefine。propose_define_generated_class 只用于已经有编译后 .class base64 的高级情况。所有生成类必须精确位于 com.fangnai.hacker.generated 包，不要声称未确认的 define 已执行。\n");
         prompt.append("修改已存在 generated class 工具时，必须复用完全相同的 className；不要生成 V2/V3/Fixed/New/Updated/带 hash 后缀的新类，除非玩家明确要求保留一个独立新工具。同名 className 会覆盖保存的 source/class/recipe/doc，并在类已加载时先尝试 JVM instrumentation redefine；若 redefine 因类结构变化（新增/删除字段方法）失败，会自动用新隔离 ClassLoader 加载新版本，旧版在解除引用后被 GC。\n");
         prompt.append("live redefine（instrumentation）只能稳定修改方法体；新增/删除字段或方法会导致 instrumentation redefine 失败，系统会回退到隔离 ClassLoader 定义。若必须改变类结构，直接给出完整新版即可，系统会自动处理，不需要生成 V2 类名。\n");

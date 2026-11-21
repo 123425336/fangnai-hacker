@@ -31,6 +31,11 @@ public final class SavedToolProposal extends ActionProposal {
 
     @Override
     public void execute() {
+        if (com.fangnai.hacker.client.config.HackerClientConfig.ai().autoRunAfterDefine) {
+            // 执行后把结果交给 AI 判断，没达成目标就自动修复再执行
+            AiConversationManager.get().startAutoRunWorkflow(this);
+            return;
+        }
         ToolRegistry.SavedToolExecutionResult result = ToolRegistry.get()
                 .executeSavedTool(toolId, input, reason(), expectedEffect());
         if (result == null) {
