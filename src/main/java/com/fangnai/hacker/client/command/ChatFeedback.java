@@ -1,5 +1,6 @@
 package com.fangnai.hacker.client.command;
 
+import com.fangnai.hacker.client.ai.session.AiChatLog;
 import com.mojang.logging.LogUtils;
 import net.minecraft.ChatFormatting;
 import net.minecraft.client.Minecraft;
@@ -18,26 +19,31 @@ public final class ChatFeedback {
 
     public static void info(String message) {
         LOGGER.info("{}{}", PREFIX, message);
+        AiChatLog.get().info(message);
         send(Component.literal(PREFIX).withStyle(ChatFormatting.AQUA).append(Component.literal(message).withStyle(ChatFormatting.WHITE)));
     }
 
     public static void warn(String message) {
         LOGGER.warn("{}{}", PREFIX, message);
+        AiChatLog.get().warn(message);
         send(Component.literal(PREFIX).withStyle(ChatFormatting.YELLOW).append(Component.literal(message).withStyle(ChatFormatting.GOLD)));
     }
 
     public static void error(String message) {
         LOGGER.error("{}{}", PREFIX, message);
+        AiChatLog.get().error(message);
         send(Component.literal(PREFIX).withStyle(ChatFormatting.RED).append(Component.literal(message).withStyle(ChatFormatting.RED)));
     }
 
     public static void answer(String message) {
         LOGGER.info("{}AI answer: {}", PREFIX, truncate(message, 2000));
+        AiChatLog.get().assistant(message);
         send(Component.literal(PREFIX).withStyle(ChatFormatting.AQUA).append(Component.literal(message).withStyle(ChatFormatting.WHITE)));
     }
 
     public static void pending(String id, String summary) {
         LOGGER.warn("{}Pending action {}: {}", PREFIX, id, summary);
+        AiChatLog.get().pending(id, summary);
         MutableComponent line = Component.literal(PREFIX).withStyle(ChatFormatting.AQUA)
                 .append(Component.literal("需要确认：").withStyle(ChatFormatting.YELLOW))
                 .append(Component.literal(summary).withStyle(ChatFormatting.WHITE))

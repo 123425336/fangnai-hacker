@@ -2,27 +2,38 @@ package com.fangnai.hacker.client.command;
 
 import com.fangnai.hacker.client.ai.action.EntityClearProposal;
 import com.fangnai.hacker.client.ai.action.PendingActionRegistry;
+import com.fangnai.hacker.client.ai.api.AiClientFactory;
+import com.fangnai.hacker.client.ai.session.AiChatLog;
 import com.fangnai.hacker.client.ai.session.AiConversationManager;
 import com.fangnai.hacker.client.ai.tool.ToolRegistry;
 import com.fangnai.hacker.client.config.HackerClientConfig;
 import com.fangnai.hacker.client.generated.FangnaiRemove;
 import com.fangnai.hacker.client.instrument.InstrumentationAccess;
+import com.fangnai.hacker.client.screen.FangnaiAiScreen;
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.mojang.brigadier.builder.RequiredArgumentBuilder;
 import com.mojang.brigadier.tree.CommandNode;
+import net.minecraft.client.Minecraft;
 import net.minecraft.commands.SharedSuggestionProvider;
 
 import java.util.Locale;
 
 public final class FangnaiHackerCommands {
+    /** 打开 AI 对话界面的指令名。 */
+    public static final String GUI_COMMAND = "fangnaigui";
+
     private FangnaiHackerCommands() {
     }
 
     public static void register(CommandDispatcher<SharedSuggestionProvider> dispatcher) {
         if (dispatcher == null) {
             return;
+        }
+        // /fangnaigui：打开 AI 对话界面（只注册一次，用于聊天栏补全提示）
+        if (dispatcher.getRoot().getChild(GUI_COMMAND) == null) {
+            dispatcher.register(literal(GUI_COMMAND).executes(context -> openGui()));
         }
         CommandNode<SharedSuggestionProvider> root = dispatcher.getRoot().getChild("fangnai");
         if (root != null && root.getChild("hacker") != null) {
@@ -78,6 +89,10 @@ public final class FangnaiHackerCommands {
         }
 
         String[] root = trimmed.split("\\s+", 3);
+        if (GUI_COMMAND.equalsIgnoreCase(root[0])) {
+            openGui();
+            return true;
+        }
         if (!"fangnai".equalsIgnoreCase(root[0])) {
             return false;
         }
@@ -192,7 +207,26 @@ public final class FangnaiHackerCommands {
         ChatFeedback.warn("未知 tools 子命令：" + action);
     }
 
+    /** GUI 输入框发送内容时调用，与聊天栏 /fangnai hacker <内容> 走同一套流程。 */
+    public static void submitPrompt(String prompt) {
+        if (prompt == null || prompt.isBlank()) {
+            return;
+        }
+        ask(prompt.trim());
+    }
+
+    /**
+     * 打开 AI 对话界面。从聊天栏执行时聊天界面会在指令处理完后关闭自己，
+     * 所以这里放到下一帧再打开，避免刚打开就被关掉。
+     */
+    public static int openGui() {
+        Minecraft minecraft = Minecraft.getInstance();
+        minecraft.tell(() -> minecraft.setScreen(new FangnaiAiScreen()));
+        return 1;
+    }
+
     private static int ask(String prompt) {
+        AiChatLog.get().user(prompt);
         EntityClearProposal clearProposal = EntityClearProposal.fromPrompt(prompt);
         if (clearProposal != null) {
             PendingActionRegistry.get().add(clearProposal);
@@ -213,6 +247,7 @@ public final class FangnaiHackerCommands {
         ChatFeedback.info("AI enabled=" + ai.enabled
                 + ", endpoint=" + ai.endpointMode
                 + ", baseUrl=" + ai.baseUrl
+                + ", url=" + AiClientFactory.resolveEndpoint(ai)
                 + ", model=" + (ai.model.isBlank() ? "not set" : ai.model)
                 + ", key=" + ai.maskedApiKey()
                 + ", request=" + AiConversationManager.get().status()
@@ -225,7 +260,7 @@ public final class FangnaiHackerCommands {
     private static int reload() {
         HackerClientConfig.load();
         ToolRegistry.get().reload();
-        ChatFeedback.info("已重载 AI 配置与工具索引。");
+        ChatFeedback.info("已重载 AI 配置与工具索引。实际请求地址：" + AiClientFactory.resolveEndpoint(HackerClientConfig.ai()));
         return 1;
     }
 
@@ -276,7 +311,7 @@ public final class FangnaiHackerCommands {
     }
 
     private static int help() {
-        ChatFeedback.info("用法：/fangnai hacker <自然语言>，或 status/reload/cancel/confirm/deny/confirmall/denyall/tools list/memory status/memory clear。示例：清除羊、全部清除、循环清除、停止循环清除。AI 生成多个待确认操作时会在底部显示\"全部确认\"按钮。");
+        ChatFeedback.info("输入 /" + GUI_COMMAND + " 打开 AI 对话界面。用法：/fangnai hacker <自然语言>，或 status/reload/cancel/confirm/deny/confirmall/denyall/tools list/memory status/memory clear。示例：清除羊、全部清除、循环清除、停止循环清除。AI 生成多个待确认操作时会在底部显示\"全部确认\"按钮。");
         return 1;
     }
 }

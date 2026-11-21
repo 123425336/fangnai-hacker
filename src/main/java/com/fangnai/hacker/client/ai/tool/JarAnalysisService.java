@@ -72,8 +72,11 @@ public final class JarAnalysisService {
             case "list_jars" -> listJars();
             case "list_entries" -> listEntries(resolveJar(jarSelector));
             case "manifest" -> manifest(resolveJar(jarSelector));
-            case "find_class" -> findClass(resolveJar(jarSelector), firstNonBlank(classPattern, searchText));
-            case "javap_class" -> javapClass(resolveJar(jarSelector), classPattern);
+            // jarSelector 留空时自动在整个 mods 目录里搜索，避免 AI 不知道类在哪个 jar 时直接报错
+            case "find_class" -> isBlank(jarSelector)
+                    ? findClassInAllJars(firstNonBlank(classPattern, searchText))
+                    : findClass(resolveJar(jarSelector), firstNonBlank(classPattern, searchText));
+            case "javap_class" -> javapClass(isBlank(jarSelector) ? locateJarForClass(classPattern) : resolveJar(jarSelector), classPattern);
             default -> throw new IllegalArgumentException("不支持的 jar 分析模式：" + rawMode);
         };
     }
@@ -152,6 +155,111 @@ public final class JarAnalysisService {
             builder.append("... 仅显示前 200 个匹配，请缩小 classPattern。\n");
         }
         return new AnalysisResult("find class: " + jar.getFileName(), limitOutput(builder.toString()));
+    }
+
+    /** 在 mods 目录的所有 jar 中查找类名包含关键字的类，结果按 jar 分组输出。 */
+    private AnalysisResult findClassInAllJars(String query) throws Exception {
+        if (query == null || query.isBlank()) {
+            throw new IllegalArgumentException("find_class 需要 classPattern 或 searchText。");
+        }
+        String lower = normalizeClassQuery(query).toLowerCase(Locale.ROOT);
+        Path mods = realModsDir();
+        List<Path> jars = jarsInMods(mods);
+        StringBuilder builder = new StringBuilder("Scope: mods 目录全部 jar（").append(jars.size()).append(" 个）\n")
+                .append("Query: ").append(query).append('\n');
+        int total = 0;
+        int jarHits = 0;
+        for (Path jar : jars) {
+            List<String> matches = matchClasses(jar, lower);
+            if (matches.isEmpty()) {
+                continue;
+            }
+            jarHits++;
+            builder.append("\nJar: ").append(jar.getFileName()).append("（").append(matches.size()).append(" 个匹配）\n");
+            for (String match : matches.stream().sorted().limit(Math.max(0, 200 - total)).toList()) {
+                builder.append("- ").append(match).append('\n');
+                total++;
+            }
+            if (total >= 200) {
+                builder.append("... 仅显示前 200 个匹配，请缩小 classPattern 或指定 jarSelector。\n");
+                break;
+            }
+        }
+        builder.insert(0, "Matches: " + total + "，命中 jar: " + jarHits + "\n");
+        if (total == 0) {
+            builder.append("\n没有任何 jar 包含匹配的类。可换一个关键字（如英文名、注册名片段）再搜。\n");
+        }
+        return new AnalysisResult("find class: 全部 mods", limitOutput(builder.toString()));
+    }
+
+    /** 根据类名定位所在 jar：先按精确类名找，再按包含关键字找；只有唯一 jar 命中时才返回。 */
+    private Path locateJarForClass(String classPattern) throws Exception {
+        if (classPattern == null || classPattern.isBlank()) {
+            throw new IllegalArgumentException("javap_class 需要 classPattern。可先使用 find_class（可不填 jarSelector）查找准确类名。");
+        }
+        String normalized = normalizeClassQuery(classPattern);
+        String exactEntry = normalized.replace('.', '/') + ".class";
+        Path mods = realModsDir();
+        List<Path> jars = jarsInMods(mods);
+        List<Path> exactJars = new ArrayList<>();
+        for (Path jar : jars) {
+            try (JarFile jarFile = new JarFile(jar.toFile())) {
+                if (jarFile.getEntry(exactEntry) != null) {
+                    exactJars.add(jar);
+                }
+            } catch (Exception ignored) {
+                // 损坏或无法读取的 jar 直接跳过
+            }
+        }
+        if (exactJars.size() == 1) {
+            return exactJars.get(0);
+        }
+        List<Path> fuzzyJars = new ArrayList<>();
+        if (exactJars.isEmpty()) {
+            String lower = normalized.toLowerCase(Locale.ROOT);
+            for (Path jar : jars) {
+                if (!matchClasses(jar, lower).isEmpty()) {
+                    fuzzyJars.add(jar);
+                }
+            }
+            if (fuzzyJars.size() == 1) {
+                return fuzzyJars.get(0);
+            }
+        }
+        List<Path> candidates = exactJars.isEmpty() ? fuzzyJars : exactJars;
+        if (candidates.isEmpty()) {
+            throw new IllegalArgumentException("mods 目录所有 jar 中都没有找到类：" + classPattern + "。可先用 find_class 搜索关键字。");
+        }
+        StringBuilder builder = new StringBuilder("类 " + classPattern + " 出现在多个 jar 中，请指定 jarSelector：");
+        candidates.stream().limit(10).forEach(path -> builder.append("\n- ").append(path.getFileName()));
+        throw new IllegalArgumentException(builder.toString());
+    }
+
+    /** 扫描单个 jar，返回类名（小写比较）包含关键字的全部类。 */
+    private List<String> matchClasses(Path jar, String lowerQuery) {
+        List<String> matches = new ArrayList<>();
+        try (JarFile jarFile = new JarFile(jar.toFile())) {
+            var entries = jarFile.entries();
+            int scanned = 0;
+            while (entries.hasMoreElements() && scanned < HackerClientConfig.ai().jarAnalysisMaxEntries) {
+                JarEntry entry = entries.nextElement();
+                scanned++;
+                String name = entry.getName();
+                if (!entry.isDirectory() && name.endsWith(".class")) {
+                    String className = entryToClassName(name);
+                    if (className.toLowerCase(Locale.ROOT).contains(lowerQuery)) {
+                        matches.add(className);
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+            // 无法读取的 jar 不影响其余 jar 的搜索
+        }
+        return matches;
+    }
+
+    private static boolean isBlank(String value) {
+        return value == null || value.isBlank();
     }
 
     private AnalysisResult javapClass(Path jar, String classPattern) throws Exception {

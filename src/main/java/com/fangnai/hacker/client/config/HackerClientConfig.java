@@ -15,6 +15,8 @@ import java.io.Writer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.FileTime;
 import java.util.Locale;
 
 public final class HackerClientConfig {
@@ -22,6 +24,8 @@ public final class HackerClientConfig {
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
     private static final Path CONFIG_PATH = FMLPaths.CONFIGDIR.get().resolve("hacker-client.json");
     private static HackerClientConfig INSTANCE;
+    /** 最近一次由本模组读取/写入配置文件后的修改时间，用来判断文件是否被外部手动编辑过。 */
+    private static volatile long lastKnownModifiedMillis = -1L;
 
     public int version = CURRENT_VERSION;
     public double guiPanelX = 20;
@@ -47,10 +51,11 @@ public final class HackerClientConfig {
         return get().ai;
     }
 
-    public static void load() {
+    public static synchronized void load() {
         HackerClientConfig loaded = null;
         JsonObject raw = null;
-        if (Files.isRegularFile(CONFIG_PATH)) {
+        boolean fileExists = Files.isRegularFile(CONFIG_PATH);
+        if (fileExists) {
             try (Reader reader = Files.newBufferedReader(CONFIG_PATH, StandardCharsets.UTF_8)) {
                 JsonElement element = JsonParser.parseReader(reader);
                 if (element != null && element.isJsonObject()) {
@@ -63,6 +68,10 @@ public final class HackerClientConfig {
         }
 
         if (loaded == null) {
+            // 文件存在但解析失败时先备份，防止下面写回默认值时把玩家的 Key 等配置覆盖掉
+            if (fileExists) {
+                backupBrokenFile();
+            }
             loaded = new HackerClientConfig();
         }
         if (loaded.killArea == null) {
@@ -78,7 +87,7 @@ public final class HackerClientConfig {
         save();
     }
 
-    public static void save() {
+    public static synchronized void save() {
         if (INSTANCE == null) {
             return;
         }
@@ -89,6 +98,58 @@ public final class HackerClientConfig {
             try (Writer writer = Files.newBufferedWriter(CONFIG_PATH, StandardCharsets.UTF_8)) {
                 GSON.toJson(INSTANCE, writer);
             }
+        } catch (IOException ignored) {
+        }
+        lastKnownModifiedMillis = currentModifiedMillis();
+    }
+
+    /**
+     * 如果配置文件在游戏运行期间被手动修改过，就重新读取它。
+     * 解析失败（比如玩家正改到一半、JSON 不完整）时保留内存中的配置，不覆盖文件。
+     *
+     * @return 是否真的重新加载了配置
+     */
+    public static synchronized boolean reloadIfChangedOnDisk() {
+        long modified = currentModifiedMillis();
+        if (modified < 0L || modified == lastKnownModifiedMillis) {
+            return false;
+        }
+        try (Reader reader = Files.newBufferedReader(CONFIG_PATH, StandardCharsets.UTF_8)) {
+            JsonElement element = JsonParser.parseReader(reader);
+            if (element == null || !element.isJsonObject()) {
+                lastKnownModifiedMillis = modified;
+                return false;
+            }
+        } catch (Exception ignored) {
+            // JSON 暂时不合法：记录时间避免反复尝试，等玩家下次保存文件再读
+            lastKnownModifiedMillis = modified;
+            return false;
+        }
+        load();
+        return true;
+    }
+
+    /** 配置文件的绝对路径（GUI 中展示给玩家）。 */
+    public static Path path() {
+        return CONFIG_PATH;
+    }
+
+    private static long currentModifiedMillis() {
+        try {
+            if (!Files.isRegularFile(CONFIG_PATH)) {
+                return -1L;
+            }
+            FileTime time = Files.getLastModifiedTime(CONFIG_PATH);
+            return time.toMillis();
+        } catch (IOException ignored) {
+            return -1L;
+        }
+    }
+
+    private static void backupBrokenFile() {
+        try {
+            Path backup = CONFIG_PATH.resolveSibling(CONFIG_PATH.getFileName() + ".broken");
+            Files.copy(CONFIG_PATH, backup, StandardCopyOption.REPLACE_EXISTING);
         } catch (IOException ignored) {
         }
     }
@@ -270,6 +331,7 @@ public final class HackerClientConfig {
         public int jarAnalysisMaxEntries = 50000;
         public int jarAnalysisMaxJarMegabytes = 256;
         public boolean jarAnalysisWorkflowEnabled = true;
+        // 以下 4 个次数字段已不再作为硬上限使用：工作流出错时会自动把错误交给 AI 重试，只能由玩家手动取消
         public int jarAnalysisWorkflowMaxAnalysisSteps = 5;
         public int jarAnalysisWorkflowMaxAiTurns = 8;
         public int jarAnalysisWorkflowMaxDefineAttempts = 3;

@@ -139,6 +139,18 @@ public final class PendingActionRegistry {
         }
     }
 
+    /** 当前仍有效的待确认操作快照（GUI 绘制确认卡片用）。 */
+    public synchronized java.util.List<ActionProposal> snapshot() {
+        expireOldActions();
+        return new java.util.ArrayList<>(actions.values());
+    }
+
+    /** 指定 id 的操作是否仍在等待确认。 */
+    public synchronized boolean isPending(String id) {
+        ActionProposal proposal = actions.get(id);
+        return proposal != null && !proposal.isExpired();
+    }
+
     public synchronized int size() {
         expireOldActions();
         return actions.size();

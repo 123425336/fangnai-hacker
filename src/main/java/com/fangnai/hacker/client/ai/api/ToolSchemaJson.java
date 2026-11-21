@@ -60,7 +60,7 @@ public final class ToolSchemaJson {
         tools.add(openAiFunction("propose_jar_analysis", "提出一个需要玩家确认后执行的 mods 目录 jar 分析/反编译操作；在已确认的 jar 自动工作流中也可作为单个定向续步。只能选择固定 mode，不能提供任意 shell 命令。", propertyObject()
                 .required("mode", "reason", "expectedEffect")
                 .string("mode", "固定枚举：list_jars、list_entries、manifest、find_class、javap_class。javap_class 使用 JDK javap 反汇编/分析单个类。")
-                .string("jarSelector", "mods 目录下 jar 文件名或唯一匹配片段；list_jars 可留空。禁止绝对路径和 ..。")
+                .string("jarSelector", "mods 目录下 jar 文件名或唯一匹配片段；list_jars 可留空；find_class、javap_class 留空时会自动在整个 mods 目录搜索；list_entries、manifest 必须填写。禁止绝对路径和 ..。")
                 .string("classPattern", "类名、包名或唯一匹配片段；javap_class 需要能解析到单个类。")
                 .string("memberPattern", "可选成员/方法提示，当前仅用于说明。")
                 .string("searchText", "可选搜索文本；find_class 可用。")

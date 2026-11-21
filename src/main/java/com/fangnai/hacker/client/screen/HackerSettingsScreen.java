@@ -49,6 +49,8 @@ public class HackerSettingsScreen extends Screen {
 
     @Override
     protected void init() {
+        // 打开前先读入玩家手动修改过的配置，避免关闭时把它覆盖掉
+        HackerClientConfig.reloadIfChangedOnDisk();
         HackerClientConfig cfg = HackerClientConfig.get();
         px = Mth.clamp((int) cfg.guiPanelX, 0, Math.max(0, width  - PANEL_W));
         py = Mth.clamp((int) cfg.guiPanelY, 0, Math.max(0, height - totalHeight()));

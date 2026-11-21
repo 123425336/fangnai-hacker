@@ -68,7 +68,12 @@ abstract class AbstractJsonAiClient implements AiClient {
                     LOGGER.info("[Fangnai AI] HTTP response attempt {}: {} status={} bodyChars={}", attempt,
                             httpRequest.uri(), response.statusCode(), response.body() == null ? 0 : response.body().length());
                     if (response.statusCode() < 200 || response.statusCode() >= 300) {
-                        throw new IllegalStateException("HTTP " + response.statusCode() + ": " + truncate(response.body(), 500));
+                        throw new AiHttpException(response.statusCode(), httpRequest.uri(),
+                                truncate(response.body(), 500), AiHttpException.looksLikeHtml(response.body()));
+                    }
+                    // 状态码正常但返回的是网页：通常是 Base URL 指到了网站前端
+                    if (AiHttpException.looksLikeHtml(response.body())) {
+                        throw new AiHttpException(response.statusCode(), httpRequest.uri(), truncate(response.body(), 120), true);
                     }
                     return settings.stream && supportsStreaming() ? parseStreamingResponse(response.body()) : parseResponse(response.body());
                 }));
@@ -105,11 +110,8 @@ abstract class AbstractJsonAiClient implements AiClient {
     }
 
     protected URI endpoint() {
-        String base = settings.baseUrl;
-        while (base.endsWith("/")) {
-            base = base.substring(0, base.length() - 1);
-        }
-        return URI.create(base + endpointPath());
+        // 统一走工厂里的地址规范化规则（自动补 /v1、防止路径重复）
+        return URI.create(AiClientFactory.resolveEndpointWithPath(settings.baseUrl, endpointPath()));
     }
 
     protected JsonArray messagesToJson(AiRequest request) {
