@@ -15,6 +15,7 @@ import com.fangnai.hacker.client.ai.api.AiRequest;
 import com.fangnai.hacker.client.ai.api.AiResponse;
 import com.fangnai.hacker.client.ai.api.AiToolCall;
 import com.fangnai.hacker.client.ai.tool.JarAnalysisService;
+import com.fangnai.hacker.client.ai.tool.RuntimeClassInspector;
 import com.fangnai.hacker.client.ai.tool.ToolOutputCapture;
 import com.fangnai.hacker.client.ai.tool.ToolRegistry;
 import com.fangnai.hacker.client.command.ChatFeedback;
@@ -1002,6 +1003,20 @@ public final class AiConversationManager {
                 }
             }
         }
+        // 报错、返回值或聊天输出里出现“找不到方法/字段/类”时，自动附上相关类在运行时的真实结构
+        String runtimeHint = "";
+        try {
+            runtimeHint = RuntimeClassInspector.get().describeForLinkageFailures(
+                    result == null ? "" : result.errorDetail(), result == null ? "" : result.returnValue(),
+                    output == null ? "" : String.join("\n", output));
+        } catch (Throwable throwable) {
+            // 附带运行时结构只是锦上添花，失败时不能影响自动流程继续
+            LOGGER.warn("[Fangnai AI] Attaching runtime class info failed: {}", throwable.toString());
+        }
+        if (!runtimeHint.isBlank()) {
+            LOGGER.info("[Fangnai AI] Attached runtime class structure to the run report ({} chars).", runtimeHint.length());
+            builder.append(truncate(runtimeHint, 6000)).append('\n');
+        }
         builder.append("- 执行后 ").append(String.format(java.util.Locale.ROOT, "%.1f", observeMillis / 1000.0D))
                 .append(" 秒内聊天栏新增输出（可能包含工具在服务端线程异步打印的结果）：");
         if (output == null || output.isEmpty()) {
@@ -1215,7 +1230,8 @@ public final class AiConversationManager {
     private static String workflowOptions(JarWorkflowContext context) {
         HackerClientConfig.AiSettings settings = HackerClientConfig.ai();
         StringBuilder builder = new StringBuilder("下一步必须且只能选择以下之一（每轮最多调用一个工具）：\n");
-        builder.append("- 信息不足：调用 propose_jar_analysis 做定向分析（find_class、javap_class 的 jarSelector 可以留空，系统会在整个 mods 目录搜索）；\n");
+        builder.append("- 信息不足：调用 propose_jar_analysis 做定向分析（find_class、javap_class 的 jarSelector 可以留空，系统会在整个 mods 目录搜索；"
+                + "已加载的类优先用 mode=runtime_members / runtime_javap 读运行时的真实结构，jar 里的内容可能与运行时不一致）；\n");
         builder.append("- 信息足够或需要修复：调用 propose_compile_define_java_class 给出完整 Java 源码");
         if (!context.className().isBlank()) {
             builder.append("，必须复用 className=").append(context.className());

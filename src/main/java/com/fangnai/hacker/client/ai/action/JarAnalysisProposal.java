@@ -55,9 +55,16 @@ public final class JarAnalysisProposal extends ActionProposal {
             builder.append("，search=").append(searchText);
         }
         builder.append("；原因：").append(reason())
-                .append("；效果：").append(expectedEffect())
-                .append("；限制：仅允许 mods 目录 jar，timeout=").append(ai.jarAnalysisTimeoutSeconds)
-                .append("s，output<=").append(ai.jarAnalysisMaxOutputChars).append(" chars");
+                .append("；效果：").append(expectedEffect());
+        switch (mode) {
+            case "runtime_members" -> builder.append("；限制：只读，用反射读取已加载类的真实成员，不修改游戏");
+            case "runtime_javap" -> builder.append("；限制：只读，会对该类做一次不改动字节码的 retransform 来抓取运行时字节码，timeout=")
+                    .append(ai.jarAnalysisTimeoutSeconds).append("s");
+            case "javap_class" -> builder.append("；限制：类已加载时优先读取运行时版本并与 jar 对比，否则读 mods 目录 jar，timeout=")
+                    .append(ai.jarAnalysisTimeoutSeconds).append("s");
+            default -> builder.append("；限制：仅允许 mods 目录 jar，timeout=").append(ai.jarAnalysisTimeoutSeconds).append("s");
+        }
+        builder.append("，output<=").append(ai.jarAnalysisMaxOutputChars).append(" chars");
         if (ai.jarAnalysisWorkflowEnabled) {
             builder.append("；确认后会在限制内自动继续分析/请求 AI/编译并 define 生成类")
                     .append("，analysisSteps<=").append(ai.jarAnalysisWorkflowMaxAnalysisSteps)

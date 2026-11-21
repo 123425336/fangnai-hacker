@@ -94,6 +94,23 @@ public final class RuntimeNameMapper {
         return lastError;
     }
 
+    /**
+     * 把运行期（混淆）的方法/字段名换回开发期名称，例如 m_数字_ 对应的真实方法名；
+     * 不需要映射、不是混淆名或映射不可用时返回 null。名称在全局唯一，所以不需要所属类。
+     */
+    public String devNameOf(String runtimeName) {
+        if (!needsRemap() || runtimeName == null) {
+            return null;
+        }
+        try {
+            ensureReady();
+            Mappings current = mappings;
+            return current == null ? null : current.runtimeToOfficial.get(runtimeName);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
     /** 游戏启动时在后台线程提前准备映射与存根，避免第一次编译时卡顿。 */
     public void warmUpAsync() {
         if (!needsRemap()) {
