@@ -57,7 +57,7 @@ public final class JarAnalysisProposal extends ActionProposal {
         builder.append("；原因：").append(reason())
                 .append("；效果：").append(expectedEffect());
         switch (mode) {
-            case "runtime_members" -> builder.append("；限制：只读，用反射读取已加载类的真实成员，不修改游戏");
+            case "runtime_members" -> builder.append("；限制：只读，用反射读取已加载类的成员（可能被类遮住而不完整），不修改游戏");
             case "runtime_javap" -> builder.append("；限制：只读，会对该类做一次不改动字节码的 retransform 来抓取运行时字节码，timeout=")
                     .append(ai.jarAnalysisTimeoutSeconds).append("s");
             case "javap_class" -> builder.append("；限制：类已加载时优先读取运行时版本并与 jar 对比，否则读 mods 目录 jar，timeout=")

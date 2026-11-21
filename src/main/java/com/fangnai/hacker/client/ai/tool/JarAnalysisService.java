@@ -348,7 +348,7 @@ public final class JarAnalysisService {
         }
         header.append(bytes != null
                 ? "来源：运行时字节码（对已加载的类做一次不改动字节码的 retransform，抓取 JVM 当前持有的版本）\n"
-                : "来源：运行时反射（抓取运行时字节码失败：" + captureError + "），下面只有成员结构，没有方法体\n");
+                : "来源：运行时反射（抓取运行时字节码失败：" + captureError + "），下面只有成员结构，没有方法体；反射可能被类遮住，结构不一定完整\n");
         Path jar = findJarForLoadedClass(type, jarSelector);
         header.append('\n').append(jarComparison(type, bytes, jar));
 
@@ -485,7 +485,8 @@ public final class JarAnalysisService {
                     ? RuntimeClassInspector.memberSetFromBytes(runtimeBytes)
                     : RuntimeClassInspector.memberSetFromReflection(type);
             if (runtimeBytes == null) {
-                builder.append('\n').append(RuntimeClassInspector.diffMembers(runtimeSet, jarSet));
+                // 没有字节码时运行时一侧来自反射，可能被类遮住，差异文案要提醒这一点
+                builder.append('\n').append(RuntimeClassInspector.diffMembers(runtimeSet, jarSet, true));
                 return builder.toString();
             }
             // 加载器重新序列化类时常常只改变方法排序和调试信息，所以要比成员和方法体指令，不能只看字节是否相同
@@ -500,7 +501,7 @@ public final class JarAnalysisService {
             }
             builder.append("运行时与 jar 存在实质差异（运行时 ").append(runtimeBytes.length).append(" 字节，jar ").append(jarBytes.length)
                     .append(" 字节）：类在加载后被转换器改写过，或 jar 与运行中的版本不是同一个。\n");
-            builder.append(RuntimeClassInspector.diffMembers(runtimeSet, jarSet));
+            builder.append(RuntimeClassInspector.diffMembers(runtimeSet, jarSet, false));
             builder.append(RuntimeClassInspector.describeChangedBodies(changedBodies));
         } catch (Exception e) {
             builder.append("对比失败：").append(e.getClass().getSimpleName()).append(": ").append(e.getMessage()).append('\n');

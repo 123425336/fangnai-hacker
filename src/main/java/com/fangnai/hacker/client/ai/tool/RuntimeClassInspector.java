@@ -42,8 +42,10 @@ import java.util.stream.Collectors;
  * 读取“当前 JVM 里真实在运行的类”。
  * jar 文件只是磁盘上的静态内容：类可能被 agent、mixin、ASM 转换器改写，磁盘上的 jar 也可能和已加载的版本不一致，
  * 所以分析已加载的类时应以运行时为准。这里提供两种只读手段：
- * 1. 反射：列出真实的字段/方法/构造器，没有任何副作用，不需要 agent；
- * 2. 抓取字节码：用一个只记录、不修改的转换器，通过 retransform 取到 JVM 当前持有的字节码。
+ * 1. 反射：列出反射能看到的字段/方法/构造器，没有任何副作用，不需要 agent；
+ *    但反射视图可能被类刻意遮住（成员在 JVM 里存在、能正常调用，却不出现在 getDeclaredXxx 里），
+ *    所以“反射里没有”不等于“运行时没有”，需要字节码或编译期直接调用来佐证；
+ * 2. 抓取字节码：用一个只记录、不修改的转换器，通过 retransform 取到 JVM 当前持有的字节码，不受反射遮蔽影响。
  */
 public final class RuntimeClassInspector {
     private static final RuntimeClassInspector INSTANCE = new RuntimeClassInspector();
@@ -53,7 +55,7 @@ public final class RuntimeClassInspector {
     private static final int MAX_DIFF_LINES = 80;
     private static final Pattern DOTTED_NAME = Pattern.compile("[A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)+");
     private static final Pattern LINKAGE_ERROR = Pattern.compile(
-            "(?:NoSuchMethod|NoSuchField|NoClassDefFound|ClassNotFound|IllegalAccess|IncompatibleClassChange|AbstractMethod)\\w*:\\s*([^\\r\\n]+)");
+            "((?:NoSuchMethod|NoSuchField|NoClassDefFound|ClassNotFound|IllegalAccess|IncompatibleClassChange|AbstractMethod)\\w*):\\s*([^\\r\\n]+)");
 
     private RuntimeClassInspector() {
     }
@@ -148,7 +150,8 @@ public final class RuntimeClassInspector {
         String filter = memberFilter == null ? "" : memberFilter.trim().toLowerCase(Locale.ROOT);
         StringBuilder builder = new StringBuilder();
         builder.append("类：").append(type.getName()).append('\n');
-        builder.append("来源：运行时反射（").append(loaded.origin()).append("），反映当前 JVM 里真实的类结构\n");
+        builder.append("来源：运行时反射（").append(loaded.origin()).append("），反映反射能看到的运行时成员"
+                + "（可能不完整：类可以把成员从反射里遮住，字节码或编译期直接调用的结果才是最终依据）\n");
         builder.append("加载器：").append(loaderName(type.getClassLoader())).append('\n');
         Path source = codeSourcePath(type);
         // 被游戏加载器处理过的类，代码来源常常只是根目录，只有指向具体文件时才有参考价值
@@ -422,7 +425,7 @@ public final class RuntimeClassInspector {
     }
 
     /** 对比运行时与 jar 的成员，返回人能直接读的差异说明。 */
-    public static String diffMembers(MemberSet runtime, MemberSet jar) {
+    public static String diffMembers(MemberSet runtime, MemberSet jar, boolean runtimeFromReflection) {
         if (runtime == null || jar == null) {
             return "成员对比失败：某一侧的成员无法解析。\n";
         }
@@ -452,9 +455,35 @@ public final class RuntimeClassInspector {
             return "成员（字段/方法/构造器）与 jar 完全一致。\n";
         }
         StringBuilder builder = new StringBuilder();
-        appendDiff(builder, "仅运行时有（jar 里没有，通常是被改写或注入的成员）", onlyRuntime);
-        appendDiff(builder, "仅 jar 有（运行时已经没有，按 jar 里的名字调用会失败）", onlyJar);
+        if (runtimeFromReflection) {
+            // 反射视图可能不完整：类可以把成员从反射里遮住，而 JVM 仍然能正常解析和调用它们
+            appendDiff(builder, "仅运行时有（反射里有而 jar 里没有，通常是被改写或注入的成员）", onlyRuntime);
+            appendDiff(builder, "仅 jar 有（反射里没有。这不等于运行时真的没有：成员可能只是被遮出了反射，也可能确实被移除了）", onlyJar);
+            if (!onlyJar.isEmpty()) {
+                builder.append("提醒：反射看不到成员，不能据此断定按 jar 里的名字调用会失败。验证方法：");
+                builder.append("用 mode=runtime_javap 读运行时字节码（不受反射遮蔽影响），或者写编译期直接调用（不要用反射）实际试一次并返回 e.toString()。");
+                builder.append("NoSuchMethodError/NoSuchFieldError 这类 JVM 链接错误才说明运行时真的没有，NoSuchMethodException/NoSuchFieldException 这类反射异常只说明反射看不到。\n");
+                if (countNonConstructorMembers(runtime) == 0 && countNonConstructorMembers(jar) > 0) {
+                    builder.append("特别注意：这个类在反射里没有任何字段和普通方法，而 jar 里有 ")
+                            .append(countNonConstructorMembers(jar)).append(" 个，这是反射被整体遮住的典型特征，不是类被清空了。\n");
+                }
+            }
+        } else {
+            appendDiff(builder, "仅运行时有（jar 里没有，通常是被改写或注入的成员）", onlyRuntime);
+            appendDiff(builder, "仅 jar 有（运行时字节码里已经没有，按 jar 里的名字调用会失败）", onlyJar);
+        }
         return builder.toString();
+    }
+
+    /** 成员集合里字段和普通方法的总数（不含构造器），用来识别“反射里空空如也”的情况。 */
+    private static int countNonConstructorMembers(MemberSet set) {
+        int count = set.fields().size();
+        for (String method : set.methods()) {
+            if (!method.startsWith("<init>")) {
+                count++;
+            }
+        }
+        return count;
     }
 
     /** 两边的字段/方法集合是否完全相同。 */
@@ -698,11 +727,15 @@ public final class RuntimeClassInspector {
 
     /**
      * 在报错/返回值/聊天输出里查找“找不到方法、字段、类”这类链接错误，
-     * 把错误里提到的类在运行时的真实结构整理出来，让 AI 不用凭 jar 里的名字猜。没有相关错误时返回空串。
+     * 把错误里提到的类在运行时的结构整理出来，让 AI 不用凭 jar 里的名字猜。没有相关错误时返回空串。
+     * 结构来自反射，可能被遮住，所以会按异常类型补充说明：
+     * ……Error 是 JVM 链接层报的，说明字节码里确实没有；……Exception 是反射层报的，只说明反射看不到。
      */
     public String describeForLinkageFailures(String... texts) {
         Set<String> seen = new LinkedHashSet<>();
         StringBuilder out = new StringBuilder();
+        boolean sawLinkageError = false;
+        boolean sawReflectionException = false;
         for (String text : texts) {
             if (text == null || text.isBlank()) {
                 continue;
@@ -710,7 +743,16 @@ public final class RuntimeClassInspector {
             Matcher matcher = LINKAGE_ERROR.matcher(text);
             int guard = 0;
             while (matcher.find() && guard++ < 4 && seen.size() < 2) {
-                String message = matcher.group(1).replace('/', '.');
+                String errorType = matcher.group(1);
+                // 只有“找不到”类的错误才区分是链接层还是反射层；访问权限、抽象方法之类不套用这套说明
+                boolean missing = errorType.startsWith("NoSuch") || errorType.startsWith("NoClassDefFound")
+                        || errorType.startsWith("ClassNotFound");
+                if (missing && errorType.endsWith("Exception")) {
+                    sawReflectionException = true;
+                } else if (missing) {
+                    sawLinkageError = true;
+                }
+                String message = matcher.group(2).replace('/', '.');
                 int paren = message.indexOf('(');
                 if (paren >= 0) {
                     message = message.substring(0, paren);
@@ -726,7 +768,7 @@ public final class RuntimeClassInspector {
                             LoadedClass loaded = lookup.found().get(0);
                             if (seen.add(loaded.type().getName())) {
                                 out.append("【系统自动附带】报错里提到的类 ").append(loaded.type().getName())
-                                        .append(" 在运行时的真实结构（以它为准，不要按 jar 里看到的名字猜）：\n")
+                                        .append(" 在运行时的结构（来自反射，可能不完整，见文末说明）：\n")
                                         .append(describeMembers(loaded, memberName)).append('\n');
                             }
                             break;
@@ -738,6 +780,17 @@ public final class RuntimeClassInspector {
                         candidate = candidate.substring(0, dot);
                     }
                 }
+            }
+        }
+        if (out.length() > 0) {
+            if (sawLinkageError) {
+                out.append("【系统说明】报错是 JVM 链接错误（……Error）：说明运行时字节码里确实没有这个成员或类，"
+                        + "按上面列出的成员改（列表来自反射，可能漏掉被遮住的成员，拿不准时用 mode=runtime_javap 看字节码）。\n");
+            }
+            if (sawReflectionException) {
+                out.append("【系统说明】报错是反射异常（……Exception）：只说明反射找不到，不说明运行时真的没有——类可以把成员从反射里遮住，"
+                        + "而编译期直接调用照样能成功。不要因此放弃或改走别的方案：先改成编译期直接调用（不用反射）再试一次，"
+                        + "失败时把 e.toString() 写进返回值；上面的列表里没有它，也要这样验证，不要只凭列表断定。\n");
             }
         }
         return out.toString();

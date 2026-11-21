@@ -1231,7 +1231,8 @@ public final class AiConversationManager {
         HackerClientConfig.AiSettings settings = HackerClientConfig.ai();
         StringBuilder builder = new StringBuilder("下一步必须且只能选择以下之一（每轮最多调用一个工具）：\n");
         builder.append("- 信息不足：调用 propose_jar_analysis 做定向分析（find_class、javap_class 的 jarSelector 可以留空，系统会在整个 mods 目录搜索；"
-                + "已加载的类优先用 mode=runtime_members / runtime_javap 读运行时的真实结构，jar 里的内容可能与运行时不一致）；\n");
+                + "已加载的类优先用 mode=runtime_members / runtime_javap 读运行时的结构，jar 里的内容可能与运行时不一致；"
+                + "反射可能被类遮住而看不全，成员显示缺失时用 runtime_javap 或编译期直接调用验证）；\n");
         builder.append("- 信息足够或需要修复：调用 propose_compile_define_java_class 给出完整 Java 源码");
         if (!context.className().isBlank()) {
             builder.append("，必须复用 className=").append(context.className());
@@ -1271,7 +1272,8 @@ public final class AiConversationManager {
                 + "“已排队”“queued”“已提交”之类没有结果的输出不算证据，找到的目标数为 0 也不算达成。\n"
                 + "修复建议：不要吞掉异常，把 e.toString() 和关键上下文写进返回值或直接抛出；需要在单人游戏服务端线程执行的操作，"
                 + "用 server.submit(() -> ...).get(5, TimeUnit.SECONDS) 同步拿到结果再返回，不要只 execute 后立即返回；"
-                + "反射找不到方法/字段时，把该类及其父类实际声明的成员（名称+参数类型）写进返回值，运行时的类结构可能被改写过，和 jar 里看到的不一定一样。\n\n"
+                + "方法/字段找不到时，先区分错误类型：……Error（JVM 链接错误）说明运行时确实没有；……Exception（反射异常）只说明反射看不到，"
+                + "类可能把成员从反射里遮住，应改成编译期直接调用再试一次，把 e.toString() 写进返回值，不要只凭反射列表就放弃。\n\n"
                 + workflowOptions(context);
     }
 
