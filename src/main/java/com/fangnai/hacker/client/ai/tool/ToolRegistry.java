@@ -400,6 +400,64 @@ public final class ToolRegistry {
         return builder.toString();
     }
 
+    /** 紧凑目录最多列出的工具个数。 */
+    private static final int COMPACT_CATALOG_LIMIT = 20;
+    /** 生成类统一所在的包；紧凑目录里在这个包下的类只写短类名。 */
+    private static final String GENERATED_PACKAGE_PREFIX = "com.fangnai.hacker.generated.";
+
+    /**
+     * 给模型看的紧凑版目录：每次请求都会随最后一条用户消息重新发送，而且这一段不会被服务端缓存，
+     * 所以只留下模型决策真正需要的信息，其余的让它按需用 inspect_saved_tool 现查。
+     * - 生成类工具：只写类名、当前方法和运行状态（toolId 直接填类名即可，resolveSavedTool 会解析）；
+     *   自动生成的说明、固定的能力标签、源码路径都和类名重复或可以现查，不再列出。
+     * - 其他工具：写 id、能力标签和截短的说明。
+     * 聊天里的 /fangnai 工具列表仍使用完整版 catalogForPrompt。
+     */
+    public synchronized String compactCatalogForPrompt() {
+        ensureLoaded();
+        if (tools.isEmpty()) {
+            return "(none)";
+        }
+        List<ToolMetadata> sorted = tools.stream().sorted(Comparator.comparing(tool -> tool.id)).toList();
+        // 短类名重复时（理论上同一个包下不会出现）改写完整类名，避免模型用短名时解析到不唯一的工具
+        java.util.Map<String, Integer> simpleNameCounts = new java.util.HashMap<>();
+        for (ToolMetadata tool : sorted) {
+            if (isGeneratedClassCapability(tool.capability) && tool.className != null && !tool.className.isBlank()) {
+                simpleNameCounts.merge(simpleClassName(tool.className).toLowerCase(Locale.ROOT), 1, Integer::sum);
+            }
+        }
+        StringBuilder builder = new StringBuilder();
+        int shown = 0;
+        for (ToolMetadata tool : sorted) {
+            if (shown >= COMPACT_CATALOG_LIMIT) {
+                break;
+            }
+            hydrateGeneratedToolMetadata(tool);
+            if (isGeneratedClassCapability(tool.capability) && tool.className != null && !tool.className.isBlank()) {
+                boolean standardPackage = tool.className.startsWith(GENERATED_PACKAGE_PREFIX)
+                        && tool.className.indexOf('.', GENERATED_PACKAGE_PREFIX.length()) < 0;
+                boolean unique = simpleNameCounts.getOrDefault(simpleClassName(tool.className).toLowerCase(Locale.ROOT), 0) <= 1;
+                builder.append("- ").append(standardPackage && unique ? simpleClassName(tool.className) : tool.className)
+                        .append(" methods=").append(methodsForPrompt(tool.methods));
+                if (tool.runtimeStatus != null && !tool.runtimeStatus.isBlank()) {
+                    builder.append(" runtime=").append(tool.runtimeStatus);
+                }
+            } else {
+                builder.append("- ").append(tool.id).append(" [").append(tool.capability).append("]");
+                String purpose = tool.purpose == null ? "" : tool.purpose.trim();
+                if (!purpose.isEmpty()) {
+                    builder.append(' ').append(purpose.length() > 60 ? purpose.substring(0, 60) + "…" : purpose);
+                }
+            }
+            builder.append('\n');
+            shown++;
+        }
+        if (sorted.size() > shown) {
+            builder.append("（共 ").append(sorted.size()).append(" 个，只列出前 ").append(shown).append(" 个）\n");
+        }
+        return builder.toString();
+    }
+
     public synchronized void listToChat() {
         ensureLoaded();
         if (tools.isEmpty()) {
