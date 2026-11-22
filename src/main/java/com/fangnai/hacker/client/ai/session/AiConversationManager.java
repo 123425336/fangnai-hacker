@@ -37,6 +37,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 public final class AiConversationManager {
@@ -57,6 +58,8 @@ public final class AiConversationManager {
     private final AtomicReference<SavedToolInspectContext> savedToolInspectContext = new AtomicReference<>();
     private final AtomicReference<SavedToolRecoveryContext> savedToolRecoveryContext = new AtomicReference<>();
     private final Deque<AiMessage> contextMemory = new ArrayDeque<>();
+    /** 是否正在压缩较早的上下文，避免同时发起多次压缩。 */
+    private final AtomicBoolean compressingMemory = new AtomicBoolean(false);
     private volatile boolean currentPromptRequiresCompleteBuildBatch;
     private volatile int currentBuildBatchCorrectionAttempts;
     private volatile String currentBuildPrompt = "";
@@ -332,10 +335,10 @@ public final class AiConversationManager {
         lastProgressLogMillis = requestStartedAtMillis;
         ChatFeedback.info(chatPrefix + settings.endpointMode + " / " + settings.model
                 + "，timeout=" + settings.timeoutSeconds + "s，maxTokens=" + settings.maxTokens
-                + "，context=" + memorySize() + "/" + settings.contextMemoryMaxEntries + " ...");
-        LOGGER.info("[Fangnai AI] Request started: endpointMode={}, endpoint={}, model={}, timeout={}s, maxTokens={}, promptChars={}, memory={}/{}",
+                + "，context=" + memoryBrief() + " ...");
+        LOGGER.info("[Fangnai AI] Request started: endpointMode={}, endpoint={}, model={}, timeout={}s, maxTokens={}, promptChars={}, memory={}",
                 settings.endpointMode, AiClientFactory.resolveEndpoint(settings), settings.model, settings.timeoutSeconds, settings.maxTokens,
-                promptChars, memorySize(), settings.contextMemoryMaxEntries);
+                promptChars, memoryBrief());
         CompletableFuture<AiResponse> future = client.send(new AiRequest(messages));
         currentRequest.set(future);
         future.whenComplete((response, throwable) -> Minecraft.getInstance().execute(() -> {
@@ -494,8 +497,25 @@ public final class AiConversationManager {
     public String memoryStatus() {
         HackerClientConfig.AiSettings ai = HackerClientConfig.ai();
         return "AI context memory enabled=" + ai.contextMemoryEnabled
-                + ", entries=" + memorySize() + "/" + ai.contextMemoryMaxEntries
+                + ", " + memoryBrief()
+                + ", compress=" + ai.contextMemoryCompress
                 + ", entryMaxChars=" + ai.contextMemoryEntryMaxChars;
+    }
+
+    /** 记忆占用的简短描述：条数、估算 token 数和预算，例如 “23条/≈4.1k/500k token”。 */
+    public synchronized String memoryBrief() {
+        HackerClientConfig.AiSettings ai = HackerClientConfig.ai();
+        return contextMemory.size() + "条/≈" + shortTokens(memoryTokens()) + "/" + shortTokens(ai.contextMemoryMaxTokens) + " token";
+    }
+
+    private static String shortTokens(long tokens) {
+        if (tokens >= 1_000_000L) {
+            return String.format(java.util.Locale.ROOT, "%.1fM", tokens / 1_000_000.0D);
+        }
+        if (tokens >= 1000L) {
+            return String.format(java.util.Locale.ROOT, "%.1fk", tokens / 1000.0D);
+        }
+        return Long.toString(tokens);
     }
 
     public void rememberAssistantEvent(String content) {
@@ -1091,6 +1111,122 @@ public final class AiConversationManager {
         }
         contextMemory.addLast(new AiMessage(normalizedRole, truncate(cleaned, settings.contextMemoryEntryMaxChars)));
         trimMemory();
+        scheduleCompressionIfNeeded();
+    }
+
+    /** 当前记忆占用的估算 token 数。 */
+    private synchronized long memoryTokens() {
+        long total = 0L;
+        for (AiMessage message : contextMemory) {
+            total += ContextMemoryCompressor.estimateTokens(message);
+        }
+        return total;
+    }
+
+    /** 压缩（或丢弃）后保留的最近原文大小：预算的四分之一。 */
+    private static long keepRecentTokens(HackerClientConfig.AiSettings settings) {
+        return Math.max(1L, settings.contextMemoryMaxTokens / 4L);
+    }
+
+    /**
+     * 记忆超出 token 预算时安排压缩：保留最近约四分之一预算的原文，把更早的记录交给模型压成一条摘要。
+     * 压缩是异步的，不会阻塞对话；失败、摘要为空或没法压缩时，退回成直接丢掉最旧的记录，保证不会一直超预算。
+     * 只有超出预算才会改动历史，所以平时历史前缀保持不变，对服务端的前缀缓存友好。
+     */
+    private synchronized void scheduleCompressionIfNeeded() {
+        HackerClientConfig.AiSettings settings = HackerClientConfig.ai();
+        long budget = settings.contextMemoryMaxTokens;
+        long total = memoryTokens();
+        if (total <= budget) {
+            return;
+        }
+        long keepTokens = keepRecentTokens(settings);
+        if (!settings.contextMemoryCompress) {
+            dropOldestToFit(keepTokens);
+            return;
+        }
+        if (compressingMemory.get()) {
+            // 压缩还没返回时又涨了很多：超过预算的 1.5 倍就先直接丢旧的，避免请求体失控
+            if (total > budget + budget / 2L) {
+                dropOldestToFit(keepTokens);
+            }
+            return;
+        }
+        List<AiMessage> entries = new ArrayList<>(contextMemory);
+        long kept = 0L;
+        int keptCount = 0;
+        for (int i = entries.size() - 1; i >= 0; i--) {
+            long tokens = ContextMemoryCompressor.estimateTokens(entries.get(i));
+            if (keptCount >= 2 && kept + tokens > keepTokens) {
+                break;
+            }
+            kept += tokens;
+            keptCount++;
+        }
+        int olderCount = entries.size() - keptCount;
+        if (olderCount < 2) {
+            // 较早的记录太少，没有压缩的意义：直接丢最旧的
+            dropOldestToFit(budget);
+            return;
+        }
+        if (!compressingMemory.compareAndSet(false, true)) {
+            return;
+        }
+        List<AiMessage> older = new ArrayList<>(entries.subList(0, olderCount));
+        int targetChars = Math.max(600, Math.min(6000, (int) (budget / 100L)));
+        String notice = "上下文记忆已超过 token 预算（" + memoryBrief() + "），正在让香草把较早的 " + olderCount + " 条记录压缩成摘要…";
+        LOGGER.info("[Fangnai AI] {}", notice);
+        Minecraft.getInstance().execute(() -> ChatFeedback.info(notice));
+        CompletableFuture<String> future;
+        try {
+            future = ContextMemoryCompressor.summarize(older, targetChars);
+        } catch (Throwable throwable) {
+            future = CompletableFuture.failedFuture(throwable);
+        }
+        future.whenComplete((summary, error) -> Minecraft.getInstance().execute(() -> finishCompression(older, summary, error)));
+    }
+
+    /** 压缩请求返回后，用摘要替换被压缩的那一段记录；失败或结果为空时直接丢弃这一段。 */
+    private synchronized void finishCompression(List<AiMessage> older, String summary, Throwable error) {
+        compressingMemory.set(false);
+        HackerClientConfig.AiSettings settings = HackerClientConfig.ai();
+        // 压缩期间记忆被清空或改动过（被压缩的那一段已经不在开头）：这次的结果作废
+        java.util.Iterator<AiMessage> iterator = contextMemory.iterator();
+        for (AiMessage expected : older) {
+            if (!iterator.hasNext() || iterator.next() != expected) {
+                LOGGER.info("[Fangnai AI] Context memory changed while compressing, discarding the summary.");
+                return;
+            }
+        }
+        for (int i = 0; i < older.size(); i++) {
+            contextMemory.removeFirst();
+        }
+        boolean usable = error == null && summary != null && !summary.isBlank();
+        if (usable) {
+            contextMemory.addFirst(new AiMessage("user", ContextMemoryCompressor.SUMMARY_PREFIX + truncate(summary, 20000)));
+            ChatFeedback.info("上下文已压缩：较早的 " + older.size() + " 条记录合并成 1 条摘要，当前 " + memoryBrief() + "。");
+        } else {
+            Throwable root = error instanceof CompletionException && error.getCause() != null ? error.getCause() : error;
+            ChatFeedback.warn("压缩上下文失败（" + (root == null ? "模型没有返回摘要" : root.getClass().getSimpleName() + ": " + root.getMessage())
+                    + "），已直接丢弃较早的 " + older.size() + " 条记录。");
+        }
+        // 摘要太长或预算很小时压缩后仍然超预算：直接丢最旧的，保证有界
+        if (memoryTokens() > settings.contextMemoryMaxTokens) {
+            dropOldestToFit(keepRecentTokens(settings));
+        }
+    }
+
+    /** 直接丢掉最旧的记录，直到估算 token 数不超过目标（至少保留最近两条，也就是一问一答，免得只剩一句孤零零的回复）。 */
+    private synchronized void dropOldestToFit(long targetTokens) {
+        long total = memoryTokens();
+        int dropped = 0;
+        while (contextMemory.size() > 2 && total > targetTokens) {
+            total -= ContextMemoryCompressor.estimateTokens(contextMemory.removeFirst());
+            dropped++;
+        }
+        if (dropped > 0) {
+            LOGGER.info("[Fangnai AI] Dropped {} oldest context entries to fit the token budget.", dropped);
+        }
     }
 
     private synchronized List<AiMessage> snapshotMemoryMessages() {
@@ -1105,6 +1241,7 @@ public final class AiConversationManager {
 
     private synchronized void trimMemory() {
         HackerClientConfig.AiSettings settings = HackerClientConfig.ai();
+        // 条数上限现在只是兜底的硬上限（默认很大），主要靠 token 预算控制记忆大小
         int max = Math.max(0, settings.contextMemoryMaxEntries);
         if (contextMemory.size() <= max) {
             return;

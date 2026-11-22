@@ -531,6 +531,13 @@ config/hacker-client.json
 
 如果本地兼容服务不需要 key，可以填任意占位值。
 
+上下文记忆按 token 预算管理，而不是按条数丢弃：
+
+- `contextMemoryMaxTokens`（默认 500000，估算值）：历史上下文超出这个预算时，保留最近约四分之一预算的原文，把更早的记录交给模型压缩成一条摘要；
+- `contextMemoryCompress`（默认 true）：设为 false 则超出预算时直接丢弃最旧的记录；
+- `contextMemoryMaxEntries`（默认 2000）：记录条数的兜底硬上限；
+- 预算要小于模型上下文窗口减去 `maxTokens` 和约 1.5 万 token 的系统提示词与工具定义，否则请求会因为超长被拒绝。
+
 ## 安全与确认模型
 
 本项目的 AI 操作设计遵循“提出 proposal，玩家确认后执行”的模式。

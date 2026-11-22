@@ -20,8 +20,9 @@ import java.nio.file.attribute.FileTime;
 import java.util.Locale;
 
 public final class HackerClientConfig {
-    // 版本 6：调大默认的 token 数和各类轮数上限（见 applyMissingDefaults 里的迁移）
-    private static final int CURRENT_VERSION = 6;
+    // 版本 6：调大默认的 token 数和各类轮数上限；版本 7：上下文记忆改成按 token 预算压缩
+    // （迁移见 applyMissingDefaults）
+    private static final int CURRENT_VERSION = 7;
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
     private static final Path CONFIG_PATH = FMLPaths.CONFIGDIR.get().resolve("hacker-client.json");
     private static HackerClientConfig INSTANCE;
@@ -272,8 +273,20 @@ public final class HackerClientConfig {
         if (!aiRaw.has("contextMemoryMaxEntries")) {
             loaded.ai.contextMemoryMaxEntries = defaults.ai.contextMemoryMaxEntries;
         }
+        if (!aiRaw.has("contextMemoryMaxTokens")) {
+            loaded.ai.contextMemoryMaxTokens = defaults.ai.contextMemoryMaxTokens;
+        }
+        if (!aiRaw.has("contextMemoryCompress")) {
+            loaded.ai.contextMemoryCompress = defaults.ai.contextMemoryCompress;
+        }
         if (!aiRaw.has("contextMemoryEntryMaxChars")) {
             loaded.ai.contextMemoryEntryMaxChars = defaults.ai.contextMemoryEntryMaxChars;
+        }
+
+        // 版本 7：上下文记忆改成按 token 预算压缩，旧的“最多 20 条”不再是主要限制，
+        // 仍然等于旧默认值 20 的话放宽成兜底的硬上限；玩家改过的值保持不变
+        if (oldVersion < 7 && loaded.ai.contextMemoryMaxEntries == 20) {
+            loaded.ai.contextMemoryMaxEntries = defaults.ai.contextMemoryMaxEntries;
         }
 
         // 版本 6：旧默认的 token 数和轮数上限太小，长任务跑不完。
@@ -363,7 +376,12 @@ public final class HackerClientConfig {
         /** 流式请求时要求中转站在最后返回 token 用量（含缓存命中），用来排查缓存命中率；个别不兼容的中转站可以关掉。 */
         public boolean streamIncludeUsage = true;
         public boolean contextMemoryEnabled = true;
-        public int contextMemoryMaxEntries = 20;
+        /** 历史上下文的 token 预算（估算值）：超出后把较早的记录压缩成一条摘要，而不是直接丢弃。 */
+        public int contextMemoryMaxTokens = 500000;
+        /** 超出预算时让模型把较早的记录压成摘要；关闭则直接丢弃最旧的记录。 */
+        public boolean contextMemoryCompress = true;
+        /** 记录条数的兜底硬上限，主要靠上面的 token 预算控制大小。 */
+        public int contextMemoryMaxEntries = 2000;
         public int contextMemoryEntryMaxChars = 4000;
         public boolean confirmCommands = true;
         public boolean confirmTransforms = true;
@@ -409,7 +427,8 @@ public final class HackerClientConfig {
             }
             timeoutSeconds = Mth.clamp(timeoutSeconds, 10, 600);
             maxTokens = Mth.clamp(maxTokens, 1, 131072);
-            contextMemoryMaxEntries = Mth.clamp(contextMemoryMaxEntries, 0, 100);
+            contextMemoryMaxTokens = Mth.clamp(contextMemoryMaxTokens, 1000, 4_000_000);
+            contextMemoryMaxEntries = Mth.clamp(contextMemoryMaxEntries, 0, 20000);
             contextMemoryEntryMaxChars = Mth.clamp(contextMemoryEntryMaxChars, 256, 16000);
             temperature = Mth.clamp(temperature, 0.0D, 2.0D);
             maxPendingActions = Mth.clamp(maxPendingActions, 1, 128);
