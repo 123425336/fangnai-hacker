@@ -1,6 +1,7 @@
 package com.fangnai.hacker.client.ai.session;
 
 import com.fangnai.hacker.client.ai.action.ActionProposal;
+import com.fangnai.hacker.client.ai.action.DismantleHiddenClassProposal;
 import com.fangnai.hacker.client.ai.action.JarAnalysisProposal;
 import com.fangnai.hacker.client.ai.action.JavaSourceDefineProposal;
 import com.fangnai.hacker.client.ai.action.PendingActionRegistry;
@@ -21,6 +22,7 @@ import com.fangnai.hacker.client.ai.tool.ToolRegistry;
 import com.fangnai.hacker.client.command.ChatFeedback;
 import com.fangnai.hacker.client.config.HackerClientConfig;
 import com.fangnai.hacker.client.define.ClassDefineService;
+import com.fangnai.hacker.client.transform.TransformService;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.mojang.logging.LogUtils;
@@ -191,6 +193,25 @@ public final class AiConversationManager {
                 + proposal.toolId() + " and repair until the goal is reached.");
         announceAutoRun(context);
         runToolForWorkflow(context, proposal.toolId());
+    }
+
+    /** 玩家确认拆除隐藏类：执行拆除后把真实结果交回香草，可继续后续分析/修改或在仅需拆除时直接确认完成。 */
+    public void startDismantleWorkflow(DismantleHiddenClassProposal proposal) {
+        startDismantleWorkflow(proposal, 0);
+    }
+
+    private void startDismantleWorkflow(DismantleHiddenClassProposal proposal, int waitAttempt) {
+        if (proposal == null) {
+            return;
+        }
+        if (waitForIdleThen(waitAttempt, "隐藏类拆除流程", () -> startDismantleWorkflow(proposal, waitAttempt + 1))) {
+            return;
+        }
+        JarWorkflowContext context = newAutoRunContext(proposal.reason(), proposal.expectedEffect());
+        jarWorkflowContext.set(context);
+        rememberAssistantEvent("dismantle workflow " + context.workflowId() + " authorized by user: " + proposal.summary());
+        ChatFeedback.info("已启动隐藏类拆除与自动续步流程：id=" + context.workflowId() + "。可随时在 GUI 点停止。");
+        runWorkflowDismantleHiddenClass(context, proposal);
     }
 
     /** 已有 AI 请求进行中时延后再启动，避免旧请求的回复被当成工作流回复。返回 true 表示已安排延后。 */
@@ -705,10 +726,13 @@ public final class AiConversationManager {
                 if (workflow != null) {
                     flushBatchProposals(batchPendingProposals);
                     ChatFeedback.answer(response.content());
-                    if (workflow.runRounds() > 0 && response.content().contains(GOAL_DONE_MARKER)) {
-                        // AI 根据真实执行结果确认目标已实现：自动流程正常结束
+                    if ((workflow.runRounds() > 0 || workflow.lastAnalysis().startsWith("dismantle hidden:"))
+                            && response.content().contains(GOAL_DONE_MARKER)) {
+                        // AI 根据真实执行结果或隐藏类拆除结果确认目标已实现：自动流程正常结束
                         appendMemory("assistant", response.content());
-                        finishWorkflow(workflow, true, "第 " + workflow.runRounds() + " 轮执行后已达成目标。");
+                        finishWorkflow(workflow, true, workflow.runRounds() > 0
+                                ? "第 " + workflow.runRounds() + " 轮执行后已达成目标。"
+                                : "已完成隐藏类拆除并达成目标。");
                         return;
                     }
                     if (response.content().contains(WORKFLOW_GIVE_UP_MARKER)) {
@@ -889,6 +913,10 @@ public final class AiConversationManager {
             runWorkflowJarAnalysis(context.withPhase("analyzing"), jarProposal);
             return;
         }
+        if (proposal instanceof DismantleHiddenClassProposal dismantleProposal) {
+            runWorkflowDismantleHiddenClass(context.withPhase("dismantling"), dismantleProposal);
+            return;
+        }
         if (proposal instanceof JavaSourceDefineProposal javaProposal) {
             preflightAndDefineForWorkflow(context.withPhase("defining"), javaProposal);
             return;
@@ -1008,6 +1036,30 @@ public final class AiConversationManager {
                 + " completed: " + result.title() + "; output=" + result.outputPath());
         ChatFeedback.info("正在请求 AI 继续 jar 自动分析流程（AI 第 " + next.aiTurns() + " 轮）。");
         sendWorkflowRequest(next, messages, prompt.length(), "正在请求 AI 继续 jar 自动分析流程：", 0);
+    }
+
+    private void runWorkflowDismantleHiddenClass(JarWorkflowContext context, DismantleHiddenClassProposal proposal) {
+        ChatFeedback.info("自动流程正在拆除隐藏类：target=" + proposal.targetPattern());
+        TransformService.DismantleResult result = proposal.executeResult();
+        String report = result.toPromptReport();
+        HackerClientConfig.AiSettings settings = HackerClientConfig.ai();
+        JarWorkflowContext next = context.withAnalysisSteps(context.analysisSteps() + 1)
+                .withAiTurns(context.aiTurns() + 1)
+                .withPhase("ai_continuation")
+                .withLastAnalysis("dismantle hidden: " + proposal.targetPattern())
+                .withLastAnalysisContext("隐藏类拆除报告：\n" + report);
+        jarWorkflowContext.set(next);
+        String prompt = buildWorkflowDismantleContinuationPrompt(next, proposal, report);
+        if (prompt.length() > settings.jarAnalysisWorkflowPromptMaxChars) {
+            prompt = prompt.substring(0, settings.jarAnalysisWorkflowPromptMaxChars) + "\n...工作流 prompt 已截断...";
+        }
+        List<AiMessage> messages = buildConversationMessages(settings, prompt);
+        rememberAssistantEvent("jar workflow " + next.workflowId() + " dismantled hidden classes for target="
+                + proposal.targetPattern() + ": success=" + result.success()
+                + ", newlyDismantled=" + result.newlyDismantled().size()
+                + ", alreadyDismantled=" + result.alreadyDismantled().size());
+        ChatFeedback.info("隐藏类拆除完成，正在把结果返回香草继续流程（AI 第 " + next.aiTurns() + " 轮）。");
+        sendWorkflowRequest(next, messages, prompt.length(), "正在把隐藏类拆除结果返回 AI 并继续：", 0);
     }
 
     private void preflightAndDefineForWorkflow(JarWorkflowContext context, JavaSourceDefineProposal proposal) {
@@ -1492,6 +1544,25 @@ public final class AiConversationManager {
                 + workflowOptions(context);
     }
 
+    private String buildWorkflowDismantleContinuationPrompt(JarWorkflowContext context,
+                                                            DismantleHiddenClassProposal proposal,
+                                                            String report) {
+        noteBlock("最近一次分析上下文", context.lastAnalysisContext());
+        return "这是已授权的自动工作流。你刚刚调用了 propose_dismantle_hidden_class 拆除隐藏类标志位，下面是本地真实执行的拆除报告。\n"
+                + "workflowId=" + context.workflowId() + "\n"
+                + "原始目标/原因：" + context.goal() + "\n"
+                + "预期效果：" + context.expectedEffect() + "\n"
+                + "拆除请求 targetPattern：" + proposal.targetPattern() + "\n"
+                + "进度：analysisSteps=" + context.analysisSteps() + ", aiTurns=" + context.aiTurns()
+                + ", defineAttempts=" + context.defineAttempts() + ", repairs=" + context.compileRepairs() + "\n\n"
+                + "隐藏类拆除报告：\n\u0060\u0060\u0060text\n" + report + "\n\u0060\u0060\u0060\n\n"
+                + (context.lastRunReport().isBlank() ? "" : "最近一次自动执行结果：\n"
+                + dedupBlock("最近一次自动执行结果", context.lastRunReport(), 6000) + "\n")
+                + "如果玩家原本就只要求拆除该隐藏类且报告显示拆除成功，你可以以“" + GOAL_DONE_MARKER + "”开头向玩家汇报已拆除的类名；"
+                + "如果拆除只是为了继续分析字节码或实现玩家的功能目标，请立即按下方选项继续下一步（如 mode=runtime_javap 读取拆除后的隐藏类字节码，或 propose_compile_define_java_class 编写工具）。\n\n"
+                + workflowOptions(context);
+    }
+
     /** 所有工作流 prompt 共用的“下一步只能做什么”说明，执行过工具后会多出换方法执行和宣布达成两个选项。 */
     private String workflowOptions(JarWorkflowContext context) {
         HackerClientConfig.AiSettings settings = HackerClientConfig.ai();
@@ -1499,6 +1570,7 @@ public final class AiConversationManager {
         builder.append("- 信息不足：调用 propose_jar_analysis 做定向分析（find_class、javap_class 的 jarSelector 可以留空，系统会在整个 mods 目录搜索；"
                 + "已加载的类优先用 mode=runtime_members / runtime_javap 读运行时的结构，jar 里的内容可能与运行时不一致；"
                 + "反射可能被类遮住而看不全，成员显示缺失时用 runtime_javap 或编译期直接调用验证）；\n");
+        builder.append("- 发现目标类是未拆除的隐藏类（类名常带 /0x...、isModifiableClass=false 不可修改）：调用 propose_dismantle_hidden_class 自动清除隐藏类标志位使其变为可修改类，系统会自动执行并把拆除报告交还给你；\n");
         builder.append("- 信息足够或需要修复：调用 propose_compile_define_java_class 给出完整 Java 源码");
         if (!context.className().isBlank()) {
             builder.append("，必须复用 className=").append(context.className());
@@ -1509,7 +1581,9 @@ public final class AiConversationManager {
         builder.append("；\n");
         if (context.runRounds() > 0) {
             builder.append("- 只是执行的方法选错了：调用 execute_saved_tool，toolId 用当前工具，input={\"method\":\"方法名\"}，系统会自动执行；\n");
-            builder.append("- 最近一次执行结果已经明确证明目标达成：以“").append(GOAL_DONE_MARKER).append("”开头，用文字说明证据；\n");
+        }
+        if (context.runRounds() > 0 || context.lastAnalysis().startsWith("dismantle hidden:")) {
+            builder.append("- 最近一次执行或拆除结果已经明确证明目标达成：以“").append(GOAL_DONE_MARKER).append("”开头，用文字说明证据；\n");
         }
         builder.append("- 确实无法继续：以“").append(WORKFLOW_GIVE_UP_MARKER).append("”开头说明具体原因。"
                 + "只有已经用编译期直接调用实际试过并失败、而且确实没有别的办法可试时才能这样结束；"

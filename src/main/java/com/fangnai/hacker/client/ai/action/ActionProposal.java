@@ -109,6 +109,10 @@ public abstract class ActionProposal {
         return value == null || value.isBlank() ? fallback : value.trim();
     }
 
+    protected static String firstNonBlank(String first, String second) {
+        return first != null && !first.isBlank() ? first.trim() : (second == null ? "" : second.trim());
+    }
+
     public static ActionProposal fromToolCall(AiToolCall call) {
         String name = call.name().toLowerCase(Locale.ROOT);
         JsonObject args = call.arguments();
@@ -133,6 +137,11 @@ public abstract class ActionProposal {
                     string(args, "targetPattern"),
                     string(args, "methodPattern"),
                     string(args, "returnMode"),
+                    string(args, "reason"),
+                    string(args, "expectedEffect")
+            );
+            case "propose_dismantle_hidden_class", "propose_unlock_hidden_class" -> new DismantleHiddenClassProposal(
+                    firstNonBlank(string(args, "targetPattern"), string(args, "classPattern")),
                     string(args, "reason"),
                     string(args, "expectedEffect")
             );
@@ -210,6 +219,11 @@ public abstract class ActionProposal {
                         string(object, "targetPattern"),
                         string(object, "methodPattern"),
                         string(object, "returnMode"),
+                        string(object, "reason"),
+                        string(object, "expectedEffect")
+                );
+                case "dismantle_hidden_class", "unlock_hidden_class" -> new DismantleHiddenClassProposal(
+                        firstNonBlank(string(object, "targetPattern"), string(object, "classPattern")),
                         string(object, "reason"),
                         string(object, "expectedEffect")
                 );

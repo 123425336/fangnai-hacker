@@ -29,13 +29,19 @@ public final class ToolSchemaJson {
                 .string("reason", "为什么需要修改。")
                 .string("expectedEffect", "预期效果。")
                 .build()));
-        tools.add(openAiFunction("propose_default_return_transform", "提出一个需要玩家确认后执行的 ASM transform：auto_default 安全处理 void、数值和 boolean，但保留对象/数组返回方法，避免把 Iterable、同步数据等必要结果改成 null 导致游戏崩溃；已加载类匹配但修改数为 0 时会从 mods 原始字节码插桩并 redefine。reference_null 仅限玩家明确指定精确方法时使用。", propertyObject()
+        tools.add(openAiFunction("propose_default_return_transform", "提出一个需要玩家确认后执行的 ASM transform：auto_default 安全处理 void、数值和 boolean，但保留对象/数组返回方法，避免把 Iterable、同步数据等必要结果改成 null 导致游戏崩溃；遇到匹配的不可改隐藏类会自动拆除隐藏标志后再 retransform，已加载类匹配但修改数为 0 时会从 mods 原始字节码插桩并 redefine。reference_null 仅限玩家明确指定精确方法时使用。", propertyObject()
                 .required("targetPattern", "returnMode", "reason", "expectedEffect")
-                .string("targetPattern", "类名、包名前缀、mod 提示或正则描述。")
+                .string("targetPattern", "类名、包名前缀、带 /0x... 后缀的运行时隐藏类名、mod 提示或正则描述。")
                 .string("methodPattern", "可选方法名或正则；留空代表所有支持返回类型的方法。")
                 .string("returnMode", "固定枚举：auto_default、void_return、boolean_false、int_zero、reference_null。auto_default 处理 void/原始数值/boolean，并保留对象与数组返回；reference_null 风险高，只能用于精确 methodPattern。")
                 .string("reason", "为什么需要修改。")
                 .string("expectedEffect", "预期效果。")
+                .build()));
+        tools.add(openAiFunction("propose_dismantle_hidden_class", "当发现目标类是 JVM 隐藏类（类名常带 /0x... 后缀、isModifiableClass=false 不可修改）时，调用此工具自动拆除对应隐藏类：仅永久清除 HotSpot 17 隐藏类标志位使其变为可修改类（isModifiableClass=true），不改动方法字节码。在已授权的自动工作流中会直接自动执行并把拆除结果交还给你继续后续分析或修改；单独提出时等待玩家确认。", propertyObject()
+                .required("targetPattern", "reason", "expectedEffect")
+                .string("targetPattern", "目标隐藏类的运行时类名（可带 /0x...）、具名模板类名、包名前缀或唯一匹配片段；会自动排除 Lambda/动态代理等 JVM 合成隐藏类。")
+                .string("reason", "为什么需要拆除这个隐藏类（例如发现目标类为隐藏类不可改，需要先解锁以抓取真实字节码或执行 retransform/redefine）。")
+                .string("expectedEffect", "预期拆除哪些隐藏类以及拆除后下一步准备做什么。")
                 .build()));
         tools.add(openAiFunction("execute_saved_tool", "提出使用已保存工具完成相似需求。仍会按工具能力要求玩家确认。若是 generated class 工具且用户要求执行其中方法，input 必须提供 JSON，如 {\"method\":\"clearNonPlayerEntities\"}；优先使用已保存工具目录里 methods=[...] 的当前方法名；不确定或失败后先用 inspect_saved_tool 查看当前源码/方法。确认后本地会加载/define/redefine class 并在同一次流程里调用该方法。", propertyObject()
                 .required("toolId", "reason")

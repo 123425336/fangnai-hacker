@@ -32,8 +32,10 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.WeakHashMap;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 import java.util.stream.Stream;
@@ -44,13 +46,80 @@ public final class TransformService {
     private static final long HOTSPOT_17_CLASS_KLASS_OFFSET = 16L;
     private static final long HOTSPOT_17_KLASS_FLAGS_OFFSET = 164L;
     private static final int HOTSPOT_HIDDEN_CLASS_FLAG = 0x04000000;
+    private static final Pattern HIDDEN_RUNTIME_SUFFIX = Pattern.compile("/(0[xX][0-9a-fA-F]+)$");
+    private static final Pattern SLASH_NOT_HIDDEN_SUFFIX = Pattern.compile("/(?!0[xX])");
     private static final sun.misc.Unsafe UNSAFE = findUnsafe();
+
+    /** 记录本次会话中已永久清除 HotSpot 隐藏类标志位的 Class（弱引用不阻止类卸载）。 */
+    private final Set<Class<?>> dismantledHiddenClasses =
+            Collections.synchronizedSet(Collections.newSetFromMap(new WeakHashMap<>()));
 
     private TransformService() {
     }
 
     public static TransformService get() {
         return INSTANCE;
+    }
+
+    /** 判断运行期类名是否带有非 JVM 内部合成类的 /0x... 隐藏类后缀（即使隐藏标志已被拆除仍返回 true）。 */
+    public static boolean isHiddenRuntimeName(String name) {
+        return name != null && HIDDEN_RUNTIME_SUFFIX.matcher(name).find() && !isSyntheticHiddenClassName(name);
+    }
+
+    /** 判断是否为 Lambda / 动态代理 / 字符串拼接等 JVM 自动生成的合成隐藏类。 */
+    public static boolean isSyntheticHiddenClassName(String name) {
+        if (name == null || name.isBlank()) {
+            return true;
+        }
+        String stable = stripHiddenSuffix(name).toLowerCase(Locale.ROOT);
+        return stable.contains("$$lambda$") || stable.contains("$$proxy") || stable.contains("stringconcat");
+    }
+
+    /** 去掉运行期隐藏类名末尾的 /0x... 后缀，还原其模板具名类名。 */
+    public static String stripHiddenSuffix(String name) {
+        if (name == null) {
+            return "";
+        }
+        Matcher matcher = HIDDEN_RUNTIME_SUFFIX.matcher(name);
+        if (matcher.find()) {
+            return name.substring(0, matcher.start());
+        }
+        int slash = name.indexOf("/0x");
+        if (slash < 0) {
+            slash = name.indexOf("/0X");
+        }
+        return slash >= 0 ? name.substring(0, slash) : name;
+    }
+
+    /**
+     * 规范化类名或匹配模式中的路径分隔符（/、\ -> .），同时保留隐藏类运行期名字中的 /0x... 后缀。
+     * Java 标识符不能以数字 0 开头，因此包/内部类分隔斜杠绝不会紧跟 0x。
+     */
+    public static String normalizeClassPatternPreservingHiddenSuffix(String raw) {
+        String name = raw == null ? "" : raw.trim();
+        while (name.startsWith("/") && !name.startsWith("/0x") && !name.startsWith("/0X")) {
+            name = name.substring(1);
+        }
+        if (name.endsWith(".class")) {
+            name = name.substring(0, name.length() - ".class".length());
+        }
+        return SLASH_NOT_HIDDEN_SUFFIX.matcher(name.replace('\\', '.')).replaceAll(".");
+    }
+
+    /** 判断该类是否曾作为非合成隐藏类加载（包括未拆除与已拆除隐藏标志位的 /0x... 类）。 */
+    public boolean isHiddenOrDismantledClass(Class<?> type) {
+        if (type == null || isSyntheticHiddenClassName(type.getName())) {
+            return false;
+        }
+        return type.isHidden() || dismantledHiddenClasses.contains(type) || isHiddenRuntimeName(type.getName());
+    }
+
+    /** 判断该类是否是已被拆除隐藏标志位、当前已变为普通可修改状态的原隐藏类。 */
+    public boolean isDismantledHiddenClass(Class<?> type) {
+        if (type == null || type.isHidden()) {
+            return false;
+        }
+        return dismantledHiddenClasses.contains(type) || isHiddenRuntimeName(type.getName());
     }
 
     public void applyVoidReturnTransform(String targetPattern, String methodPattern, String reason, String expectedEffect) {
@@ -68,6 +137,10 @@ public final class TransformService {
         if (mode == ReturnMode.REFERENCE_NULL && (methodPattern == null || methodPattern.isBlank())) {
             ChatFeedback.error("reference_null 风险过高，必须提供精确 methodPattern，禁止对整类引用返回方法统一置 null。");
             return;
+        }
+        DismantleSummary autoDismantled = dismantleMatchingHiddenClasses(instrumentation, targetPattern);
+        if (!autoDismantled.newlyDismantled().isEmpty()) {
+            ChatFeedback.info("检测到匹配的不可改隐藏类，已自动拆除隐藏标志位：" + autoDismantled.newlyDismantled().size() + " 个。");
         }
         List<Class<?>> targets = resolveTargets(instrumentation, targetPattern);
         if (targets.isEmpty()) {
@@ -143,6 +216,261 @@ public final class TransformService {
                 + "。已按返回类型返回 JVM 默认值；重启游戏可恢复原始字节码。");
     }
 
+    /**
+     * 主动拆除匹配 targetPattern 的隐藏类（仅永久清除 HotSpot 17 隐藏标志位使其变为可修改类，不改动方法字节码）。
+     */
+    public synchronized DismantleResult dismantleHiddenClasses(String targetPattern, String reason, String expectedEffect) {
+        String trimmed = targetPattern == null ? "" : targetPattern.trim();
+        if (trimmed.isEmpty()) {
+            String msg = "拆除隐藏类失败：targetPattern 不能为空。";
+            ChatFeedback.warn(msg);
+            return new DismantleResult(false, "", List.of(), List.of(), List.of(), List.of(), msg);
+        }
+        Instrumentation instrumentation = InstrumentationAccess.getInstrumentation();
+        if (instrumentation == null) {
+            String msg = "拆除隐藏类需要 agent attach 成功（" + InstrumentationAccess.statusSummary() + "）。";
+            ChatFeedback.error(msg);
+            return new DismantleResult(false, trimmed, List.of(), List.of(), List.of(), List.of(), msg);
+        }
+        if (!supportsHotSpot17HiddenFlagAccess()) {
+            String msg = "当前 JVM 不支持 HotSpot 17 隐藏类标志位拆除（需要 64 位 HotSpot/OpenJDK 17）。";
+            ChatFeedback.error(msg);
+            return new DismantleResult(false, trimmed, List.of(), List.of(), List.of(), List.of(), msg);
+        }
+
+        List<Class<?>> matchedClasses = new ArrayList<>();
+        int hiddenCandidates = 0;
+        for (Class<?> loaded : instrumentation.getAllLoadedClasses()) {
+            if (loaded == null || loaded.isArray() || loaded.isPrimitive()) {
+                continue;
+            }
+            if (isSyntheticHiddenClassName(loaded.getName())) {
+                continue;
+            }
+            if (classMatches(loaded, trimmed)) {
+                matchedClasses.add(loaded);
+                if (isHiddenOrDismantledClass(loaded)) {
+                    hiddenCandidates++;
+                }
+            }
+        }
+        if (hiddenCandidates > MAX_TARGETS) {
+            String msg = "匹配的隐藏类过多（" + hiddenCandidates + " 个），请提供更精确的 targetPattern（最多允许 " + MAX_TARGETS + " 个）。";
+            ChatFeedback.warn(msg);
+            return new DismantleResult(false, trimmed, List.of(), List.of(), List.of(), List.of(), msg);
+        }
+
+        List<String> newlyDismantled = new ArrayList<>();
+        List<String> alreadyDismantled = new ArrayList<>();
+        List<String> modifiableNormal = new ArrayList<>();
+        List<String> skippedUnmodifiable = new ArrayList<>();
+
+        for (Class<?> candidate : matchedClasses) {
+            String entry = describeClassWithSuper(candidate);
+            DismantleClassOutcome outcome = dismantleSingleHiddenClass(instrumentation, candidate);
+            switch (outcome) {
+                case NEWLY_DISMANTLED -> newlyDismantled.add(entry);
+                case ALREADY_DISMANTLED -> alreadyDismantled.add(entry);
+                case UNSUPPORTED_OR_FAILED -> skippedUnmodifiable.add(entry);
+                case NOT_HIDDEN_OR_INELIGIBLE -> {
+                    if (instrumentation.isModifiableClass(candidate)) {
+                        modifiableNormal.add(entry);
+                    } else {
+                        skippedUnmodifiable.add(entry);
+                    }
+                }
+            }
+        }
+
+        if (!newlyDismantled.isEmpty() || !alreadyDismantled.isEmpty()) {
+            if (!newlyDismantled.isEmpty()) {
+                JsonObject recipe = new JsonObject();
+                recipe.addProperty("operation", "dismantle_hidden_class");
+                recipe.addProperty("targetPattern", trimmed);
+                recipe.addProperty("reason", reason == null ? "" : reason);
+                recipe.addProperty("expectedEffect", expectedEffect == null ? "" : expectedEffect);
+                recipe.addProperty("newlyDismantledCount", newlyDismantled.size());
+                recipe.addProperty("alreadyDismantledCount", alreadyDismantled.size());
+                JsonArray classes = new JsonArray();
+                newlyDismantled.forEach(classes::add);
+                recipe.add("dismantledClasses", classes);
+                ToolRegistry.get().recordRecipe("dismantle-hidden " + trimmed, "dismantle_hidden_class", recipe.toString(), "medium");
+            }
+            String msg = "隐藏类拆除完成（target=" + trimmed + "）：新拆除 " + newlyDismantled.size()
+                    + " 个，此前已拆除 " + alreadyDismantled.size() + " 个"
+                    + (modifiableNormal.isEmpty() ? "" : "，同范围普通可改类 " + modifiableNormal.size() + " 个")
+                    + "；现在它们均已支持 retransform/redefine 与 runtime_javap 字节码抓取。";
+            ChatFeedback.info(msg);
+            return new DismantleResult(true, trimmed, List.copyOf(newlyDismantled), List.copyOf(alreadyDismantled),
+                    List.copyOf(modifiableNormal), List.copyOf(skippedUnmodifiable), msg);
+        }
+
+        if (!modifiableNormal.isEmpty()) {
+            String msg = "匹配到 " + modifiableNormal.size() + " 个普通可修改类（target=" + trimmed
+                    + "），未发现 /0x 隐藏类；这些类本来就可直接修改，无需拆除。";
+            ChatFeedback.info(msg);
+            return new DismantleResult(true, trimmed, List.of(), List.of(),
+                    List.copyOf(modifiableNormal), List.copyOf(skippedUnmodifiable), msg);
+        }
+
+        String msg = skippedUnmodifiable.isEmpty()
+                ? "当前已加载类中没有找到匹配 targetPattern=" + trimmed + " 的隐藏类或目标类（可能尚未被游戏实例化加载）。"
+                : "匹配到 " + skippedUnmodifiable.size() + " 个不可修改类，但都不是可拆除的模组隐藏类（如 JDK 平台内部类）：" + trimmed;
+        ChatFeedback.warn(msg);
+        return new DismantleResult(false, trimmed, List.of(), List.of(),
+                List.of(), List.copyOf(skippedUnmodifiable), msg);
+    }
+
+    /**
+     * 尝试对单个不可修改的隐藏类永久清除 HotSpot 17 隐藏标志位。
+     * 返回 true 表示该类原本不可改且本次成功拆除为可修改类。
+     */
+    public synchronized boolean tryDismantleHiddenClass(Instrumentation instrumentation, Class<?> type) {
+        return dismantleSingleHiddenClass(instrumentation, type) == DismantleClassOutcome.NEWLY_DISMANTLED;
+    }
+
+    private synchronized DismantleSummary dismantleMatchingHiddenClasses(Instrumentation instrumentation, String targetPattern) {
+        if (instrumentation == null || targetPattern == null || targetPattern.isBlank() || !supportsHotSpot17HiddenFlagAccess()) {
+            return new DismantleSummary(List.of(), List.of());
+        }
+        List<Class<?>> candidates = new ArrayList<>();
+        for (Class<?> loaded : instrumentation.getAllLoadedClasses()) {
+            if (loaded == null || loaded.isArray() || loaded.isPrimitive()) {
+                continue;
+            }
+            if (!isHiddenOrDismantledClass(loaded) || !classMatches(loaded, targetPattern)) {
+                continue;
+            }
+            candidates.add(loaded);
+            if (candidates.size() > MAX_TARGETS) {
+                return new DismantleSummary(List.of(), List.of());
+            }
+        }
+        List<Class<?>> newly = new ArrayList<>();
+        List<Class<?>> already = new ArrayList<>();
+        for (Class<?> candidate : candidates) {
+            DismantleClassOutcome outcome = dismantleSingleHiddenClass(instrumentation, candidate);
+            if (outcome == DismantleClassOutcome.NEWLY_DISMANTLED) {
+                newly.add(candidate);
+            } else if (outcome == DismantleClassOutcome.ALREADY_DISMANTLED) {
+                already.add(candidate);
+            }
+        }
+        return new DismantleSummary(List.copyOf(newly), List.copyOf(already));
+    }
+
+    private synchronized DismantleClassOutcome dismantleSingleHiddenClass(Instrumentation instrumentation, Class<?> type) {
+        if (instrumentation == null || type == null || type.isArray() || type.isPrimitive()) {
+            return DismantleClassOutcome.NOT_HIDDEN_OR_INELIGIBLE;
+        }
+        String runtimeName = type.getName();
+        if (isPlatformClassName(runtimeName) || isSyntheticHiddenClassName(runtimeName)) {
+            return DismantleClassOutcome.NOT_HIDDEN_OR_INELIGIBLE;
+        }
+        if (instrumentation.isModifiableClass(type)) {
+            if (isDismantledHiddenClass(type)) {
+                dismantledHiddenClasses.add(type);
+                return DismantleClassOutcome.ALREADY_DISMANTLED;
+            }
+            return DismantleClassOutcome.NOT_HIDDEN_OR_INELIGIBLE;
+        }
+        if (!type.isHidden() && !isHiddenRuntimeName(runtimeName)) {
+            return DismantleClassOutcome.NOT_HIDDEN_OR_INELIGIBLE;
+        }
+        if (!supportsHotSpot17HiddenFlagAccess()) {
+            return DismantleClassOutcome.UNSUPPORTED_OR_FAILED;
+        }
+        try {
+            long klass = UNSAFE.getLong(type, HOTSPOT_17_CLASS_KLASS_OFFSET);
+            if (klass == 0L || (klass & 0x7L) != 0L) {
+                return DismantleClassOutcome.UNSUPPORTED_OR_FAILED;
+            }
+            long flagsAddress = klass + HOTSPOT_17_KLASS_FLAGS_OFFSET;
+            int flags = UNSAFE.getInt(flagsAddress);
+            if ((flags & HOTSPOT_HIDDEN_CLASS_FLAG) == 0) {
+                return DismantleClassOutcome.UNSUPPORTED_OR_FAILED;
+            }
+            UNSAFE.putInt(flagsAddress, flags & ~HOTSPOT_HIDDEN_CLASS_FLAG);
+            UNSAFE.fullFence();
+            if (instrumentation.isModifiableClass(type)) {
+                dismantledHiddenClasses.add(type);
+                return DismantleClassOutcome.NEWLY_DISMANTLED;
+            }
+            UNSAFE.putInt(flagsAddress, flags);
+            UNSAFE.fullFence();
+            return DismantleClassOutcome.UNSUPPORTED_OR_FAILED;
+        } catch (Throwable ignored) {
+            return DismantleClassOutcome.UNSUPPORTED_OR_FAILED;
+        }
+    }
+
+    private static boolean isPlatformClassName(String name) {
+        return name != null && (name.startsWith("java.") || name.startsWith("javax.")
+                || name.startsWith("jdk.") || name.startsWith("sun."));
+    }
+
+    private static String describeClassWithSuper(Class<?> type) {
+        Class<?> parent = type.getSuperclass();
+        return parent == null || parent == Object.class
+                ? type.getName()
+                : type.getName() + " (extends " + parent.getName() + ")";
+    }
+
+    private enum DismantleClassOutcome {
+        NEWLY_DISMANTLED,
+        ALREADY_DISMANTLED,
+        NOT_HIDDEN_OR_INELIGIBLE,
+        UNSUPPORTED_OR_FAILED
+    }
+
+    private record DismantleSummary(List<Class<?>> newlyDismantled, List<Class<?>> alreadyDismantled) {
+    }
+
+    public record DismantleResult(
+            boolean success,
+            String targetPattern,
+            List<String> newlyDismantled,
+            List<String> alreadyDismantled,
+            List<String> modifiableNormalMatches,
+            List<String> skippedUnmodifiableMatches,
+            String message
+    ) {
+        public String toPromptReport() {
+            StringBuilder sb = new StringBuilder();
+            sb.append("success=").append(success).append('\n');
+            sb.append("targetPattern=").append(targetPattern).append('\n');
+            sb.append("summary=").append(message).append('\n');
+            appendSampleList(sb, "newlyDismantled", newlyDismantled, 30);
+            appendSampleList(sb, "alreadyDismantled", alreadyDismantled, 30);
+            appendSampleList(sb, "modifiableNormalMatches", modifiableNormalMatches, 15);
+            appendSampleList(sb, "skippedUnmodifiableMatches", skippedUnmodifiableMatches, 15);
+            if (!newlyDismantled.isEmpty() || !alreadyDismantled.isEmpty()) {
+                sb.append("说明：上述 /0x... 隐藏类的 HotSpot 隐藏标志位已永久清除，Instrumentation.isModifiableClass 现为 true，")
+                        .append("现在可直接对其使用 propose_jar_analysis（mode=runtime_javap / javap_class）读取真实字节码，")
+                        .append("或使用 propose_default_return_transform / propose_void_return_transform 直接修改字节码。\n")
+                        .append("注意：拆除隐藏标志不会改变 JVM 类型继承关系，带 /0x... 的类与具名模板类仍不是同一个 Class，")
+                        .append("写 generated Java 代码匹配实例时仍需对其父类（extends 所示）做 instanceof、或按注册名/getClass().getName() 匹配。\n");
+            }
+            return sb.toString();
+        }
+
+        private static void appendSampleList(StringBuilder sb, String label, List<String> items, int limit) {
+            sb.append(label).append('(').append(items.size()).append("):");
+            if (items.isEmpty()) {
+                sb.append(" []\n");
+                return;
+            }
+            sb.append('\n');
+            int shown = Math.min(items.size(), limit);
+            for (int i = 0; i < shown; i++) {
+                sb.append("  - ").append(items.get(i)).append('\n');
+            }
+            if (items.size() > shown) {
+                sb.append("  ... 另有 ").append(items.size() - shown).append(" 项已省略\n");
+            }
+        }
+    }
+
     private OwnedTransformAttempt tryTargetOwnedInstrumentation(Instrumentation defaultInstrumentation,
                                                                  String targetPattern, List<Class<?>> normalTargets,
                                                                  String methodPattern, ReturnMode mode) {
@@ -151,27 +479,17 @@ public final class TransformService {
         if (owners.isEmpty()) {
             return null;
         }
-        Map<String, byte[]> templates;
-        try {
-            templates = findClassBytesInMods(targetPattern);
-        } catch (Throwable throwable) {
-            templates = Map.of();
-        }
         for (InstrumentationOwner owner : owners) {
-            List<HiddenClassState> hiddenStates = unlockTemplateBackedHiddenClasses(
-                    owner.instrumentation(), targetPattern, templates.keySet());
-            try {
-                List<Class<?>> combinedTargets = orderTargets(normalTargets, hiddenStates, owner.holderClasses());
-                if (combinedTargets.isEmpty() || combinedTargets.size() > MAX_TARGETS) {
-                    continue;
-                }
-                TransformAttempt attempt = retransform(owner.instrumentation(), combinedTargets, methodPattern, mode);
-                if (attempt.transformInvocations() > 0) {
-                    return new OwnedTransformAttempt(owner.instrumentation(), combinedTargets,
-                            hiddenStates.size(), attempt);
-                }
-            } finally {
-                restoreHiddenFlags(hiddenStates);
+            dismantleMatchingHiddenClasses(owner.instrumentation(), targetPattern);
+            List<Class<?>> combinedTargets = orderTargets(normalTargets, owner.holderClasses());
+            if (combinedTargets.isEmpty() || combinedTargets.size() > MAX_TARGETS) {
+                continue;
+            }
+            int hiddenCount = (int) combinedTargets.stream().filter(this::isHiddenOrDismantledClass).count();
+            TransformAttempt attempt = retransform(owner.instrumentation(), combinedTargets, methodPattern, mode);
+            if (attempt.transformInvocations() > 0) {
+                return new OwnedTransformAttempt(owner.instrumentation(), combinedTargets,
+                        hiddenCount, attempt);
             }
         }
         return null;
@@ -207,15 +525,14 @@ public final class TransformService {
         return result;
     }
 
-    private List<Class<?>> orderTargets(List<Class<?>> normalTargets, List<HiddenClassState> hiddenStates,
-                                        List<Class<?>> ownershipHolders) {
+    private List<Class<?>> orderTargets(List<Class<?>> normalTargets, List<Class<?>> ownershipHolders) {
         Set<Class<?>> holders = Collections.newSetFromMap(new IdentityHashMap<>());
         holders.addAll(ownershipHolders);
         Set<Class<?>> seen = Collections.newSetFromMap(new IdentityHashMap<>());
         List<Class<?>> ordered = new ArrayList<>();
-        for (HiddenClassState hidden : hiddenStates) {
-            if (seen.add(hidden.type())) {
-                ordered.add(hidden.type());
+        for (Class<?> target : normalTargets) {
+            if (!holders.contains(target) && isHiddenOrDismantledClass(target) && seen.add(target)) {
+                ordered.add(target);
             }
         }
         for (Class<?> target : normalTargets) {
@@ -229,56 +546,6 @@ public final class TransformService {
             }
         }
         return ordered;
-    }
-
-    private List<HiddenClassState> unlockTemplateBackedHiddenClasses(Instrumentation instrumentation,
-                                                                      String targetPattern,
-                                                                      Set<String> templateClassNames) {
-        List<HiddenClassState> states = new ArrayList<>();
-        if (!supportsHotSpot17HiddenFlagAccess() || templateClassNames.isEmpty()) {
-            return states;
-        }
-        for (Class<?> type : instrumentation.getAllLoadedClasses()) {
-            if (type == null || !type.isHidden() || !classMatches(type, targetPattern)) {
-                continue;
-            }
-            String runtimeName = type.getName();
-            String stableName = runtimeName.contains("/")
-                    ? runtimeName.substring(0, runtimeName.indexOf('/')) : runtimeName;
-            String lower = stableName.toLowerCase(Locale.ROOT);
-            if (lower.contains("$$lambda$") || lower.contains("$$proxy")
-                    || lower.contains("stringconcat") || !templateClassNames.contains(stableName)) {
-                continue;
-            }
-            try {
-                long klass = UNSAFE.getLong(type, HOTSPOT_17_CLASS_KLASS_OFFSET);
-                if (klass == 0L || (klass & 0x7L) != 0L) {
-                    continue;
-                }
-                long flagsAddress = klass + HOTSPOT_17_KLASS_FLAGS_OFFSET;
-                int flags = UNSAFE.getInt(flagsAddress);
-                if ((flags & HOTSPOT_HIDDEN_CLASS_FLAG) == 0) {
-                    continue;
-                }
-                UNSAFE.putInt(flagsAddress, flags & ~HOTSPOT_HIDDEN_CLASS_FLAG);
-                if (instrumentation.isModifiableClass(type)) {
-                    states.add(new HiddenClassState(type, flagsAddress, flags));
-                } else {
-                    UNSAFE.putInt(flagsAddress, flags);
-                }
-            } catch (Throwable ignored) {
-            }
-        }
-        return states;
-    }
-
-    private void restoreHiddenFlags(List<HiddenClassState> states) {
-        for (HiddenClassState state : states) {
-            try {
-                UNSAFE.putInt(state.flagsAddress(), state.originalFlags());
-            } catch (Throwable ignored) {
-            }
-        }
     }
 
     private boolean supportsHotSpot17HiddenFlagAccess() {
@@ -304,9 +571,6 @@ public final class TransformService {
 
     private record OwnedTransformAttempt(Instrumentation instrumentation, List<Class<?>> targets,
                                          int hiddenClasses, TransformAttempt attempt) {
-    }
-
-    private record HiddenClassState(Class<?> type, long flagsAddress, int originalFlags) {
     }
 
     private TransformAttempt retransform(Instrumentation instrumentation, List<Class<?>> targets,
@@ -463,7 +727,10 @@ public final class TransformService {
 
     private boolean classNameMatches(String name, String targetPattern) {
         String pattern = targetPattern == null ? "" : targetPattern.trim();
-        String normalized = pattern.toLowerCase(Locale.ROOT).replace('/', '.');
+        if (pattern.isEmpty()) {
+            return false;
+        }
+        String normalized = normalizeClassPatternPreservingHiddenSuffix(pattern).toLowerCase(Locale.ROOT);
         String lower = name.toLowerCase(Locale.ROOT);
         if (!normalized.isBlank() && (lower.contains(normalized) || lower.startsWith(normalized))) {
             return true;
@@ -503,6 +770,9 @@ public final class TransformService {
         List<Class<?>> targets = new ArrayList<>();
         for (Class<?> loadedClass : instrumentation.getAllLoadedClasses()) {
             if (loadedClass == null || loadedClass.isArray() || loadedClass.isPrimitive()) {
+                continue;
+            }
+            if (isSyntheticHiddenClassName(loadedClass.getName())) {
                 continue;
             }
             if (!instrumentation.isModifiableClass(loadedClass)) {

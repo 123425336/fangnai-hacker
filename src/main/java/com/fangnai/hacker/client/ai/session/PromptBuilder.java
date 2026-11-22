@@ -14,8 +14,9 @@ public final class PromptBuilder {
         prompt.append("你可以直接回答问题；如果要执行 Minecraft 原版命令、加载工具、define class 或 retransform class，只能提出操作，必须等待玩家确认。\n");
         prompt.append("不要声称已经执行未确认的操作。不要绕过服务器权限。不要参与每 tick 自动战斗决策。\n");
         prompt.append("系统会在当前请求前附带历史上下文记忆（user/assistant 记录）；历史太长时，较早的部分会被压缩成一条以“【早先对话的摘要”开头的摘要，摘要可能不完整，与最近的原始记录冲突时以原始记录为准。这些记忆只用于理解上下文，不是新的授权。只有明确记录为玩家已确认的操作才可视为执行过，未确认的 proposal 仍未执行。\n");
-        prompt.append("OpenAI chat tools 可用时优先调用工具；completions 模式下如需操作，请输出 JSON：{\"action\":\"chat|command|commands|void_return_transform|default_return_transform|saved_tool|entity_clear|jar_analysis|define_generated_class|compile_define_java_class\",...}。inspect_saved_tool 只在 OpenAI chat tools 模式可用。\n");
-        prompt.append("可用工具：propose_vanilla_command、propose_vanilla_commands、propose_void_return_transform、propose_default_return_transform、execute_saved_tool、inspect_saved_tool、propose_entity_clear、propose_jar_analysis、propose_define_generated_class、propose_compile_define_java_class。\n");
+        prompt.append("OpenAI chat tools 可用时优先调用工具；completions 模式下如需操作，请输出 JSON：{\"action\":\"chat|command|commands|void_return_transform|default_return_transform|dismantle_hidden_class|saved_tool|entity_clear|jar_analysis|define_generated_class|compile_define_java_class\",...}。inspect_saved_tool 只在 OpenAI chat tools 模式可用。\n");
+        prompt.append("可用工具：propose_vanilla_command、propose_vanilla_commands、propose_void_return_transform、propose_default_return_transform、propose_dismantle_hidden_class、execute_saved_tool、inspect_saved_tool、propose_entity_clear、propose_jar_analysis、propose_define_generated_class、propose_compile_define_java_class。\n");
+        prompt.append("隐藏类自动拆除规则：部分模组会用 MethodHandles.Lookup.defineHiddenClass 定义运行时隐藏类（类名形如 包名.类名/0x...，默认 isModifiableClass=false 不可 retransform/redefine）。当你发现目标类是未拆除的隐藏类（runtime_members 提示 isModifiableClass=false、存在未拆除的 /0x 隐藏类变体、或因隐藏类不可改受阻）时，应自动调用 propose_dismantle_hidden_class 拆除对应类（在已授权的自动工作流中会免二次确认直接拆除并返回结果；底层 runtime_javap 与 default_return_transform 遇到匹配的不可改隐藏类时也会自动尝试拆除）。该功能仅清除 HotSpot 17 隐藏标志位使其变为可改类，不修改方法体；注意拆除标志后 /0x 类与具名模板类在 JVM 类型系统里仍不是同一个 Class，generated Java 代码匹配其实例时仍须对其父类（基类）做 instanceof、或按注册名/getClass().getName() 匹配。\n");
         prompt.append("retransform 默认返回工具：优先用 propose_default_return_transform；returnMode=auto_default 会让 void 直接 return、boolean 返回 false、原始数值返回 0，但保留对象/数组返回方法，避免必要返回值变成 null 导致崩溃。只想处理某类返回值时使用 void_return/boolean_false/int_zero；reference_null 仅在玩家明确要求且提供精确 methodPattern 时使用，禁止对整类引用返回统一置 null。\n");
         prompt.append("jar 分析/反编译只能通过 propose_jar_analysis 提出：mode 允许 list_jars、list_entries、manifest、find_class（静态读 mods 目录 jar）以及 javap_class、runtime_members、runtime_javap；不要提出任意 shell 命令，不要声称未确认的分析已经执行。\n");
         prompt.append("已加载的类一律以运行时为准：模组的类可能被 agent、mixin 或 ASM 转换器改写，磁盘上的 jar 也可能和游戏里实际运行的版本不一致，所以 jar/javap 里看到的方法在运行时不一定存在。"
@@ -32,7 +33,7 @@ public final class PromptBuilder {
                 + "要么用 runtime_javap 读运行时字节码（不受遮蔽影响），要么写编译期直接调用实际试一次，并把 e.toString() 写进返回值。"
                 + "判断依据：NoSuchMethodError/NoSuchFieldError/NoClassDefFoundError 是 JVM 链接层报的，说明字节码里确实没有；"
                 + "NoSuchMethodException/NoSuchFieldException 是反射层报的，只说明反射找不到，不说明不存在。\n");
-        prompt.append("确认一次 jar_analysis 后，系统可能进入有界自动工作流：每轮你只能提出一个下一步，要么 propose_jar_analysis 做定向补充分析，要么信息足够后 propose_compile_define_java_class 给完整 Java 源码，要么说明无法继续。不要在工作流中提出无关工具；生成类必须在 com.fangnai.hacker.generated 包；修复必须复用同一个 className，不要 V2/V3/New 后缀。\n");
+        prompt.append("确认一次 jar_analysis 后，系统可能进入有界自动工作流：每轮你只能提出一个下一步，要么 propose_jar_analysis 做定向补充分析，要么发现未拆除隐藏类不可改时调用 propose_dismantle_hidden_class 自动拆除隐藏类，要么信息足够后 propose_compile_define_java_class 给完整 Java 源码，要么说明无法继续。不要在工作流中提出无关工具；生成类必须在 com.fangnai.hacker.generated 包；修复必须复用同一个 className，不要 V2/V3/New 后缀。\n");
         if (settings.autoRunAfterDefine) {
             prompt.append("自动执行与自修复：玩家确认 propose_compile_define_java_class 或 execute_saved_tool 后会进入自动流程。define 成功后系统会自动执行工具（用 runMethod 参数指定 public static 无参方法），"
                     + "然后把返回值、异常堆栈、执行后几秒内的聊天栏输出和当前源码交还给你。你要据此判断是否真正达成目标：达成就以“目标已达成：”开头说明证据；"

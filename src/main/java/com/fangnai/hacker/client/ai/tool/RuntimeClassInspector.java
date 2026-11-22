@@ -1,7 +1,9 @@
 package com.fangnai.hacker.client.ai.tool;
 
+import com.fangnai.hacker.client.command.ChatFeedback;
 import com.fangnai.hacker.client.define.RuntimeNameMapper;
 import com.fangnai.hacker.client.instrument.InstrumentationAccess;
+import com.fangnai.hacker.client.transform.TransformService;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.Handle;
 import org.objectweb.asm.Label;
@@ -79,7 +81,7 @@ public final class RuntimeClassInspector {
 
     // ── 查找类 ────────────────────────────────────────────────────────────
 
-    /** 按完整类名查找运行时的类：先找已加载的，找不到再尝试按需加载（只加载，不初始化）。 */
+    /** 按完整类名查找运行时的类：先找已加载的，找不到再尝试按需加载（只加载，不初始化）；若仅存在 /0x 隐藏类变体也会回退命中。 */
     public Lookup find(String rawName) {
         String name = normalizeName(rawName);
         if (name.isBlank()) {
@@ -90,12 +92,13 @@ public final class RuntimeClassInspector {
         Instrumentation instrumentation = InstrumentationAccess.getInstrumentation();
         if (instrumentation != null) {
             for (Class<?> type : instrumentation.getAllLoadedClasses()) {
-                if (type.getName().equals(name)) {
+                if (type != null && type.getName().equals(name)) {
                     found.add(new LoadedClass(type, "已加载"));
                 }
             }
         }
-        if (found.isEmpty()) {
+        boolean hasHiddenSuffix = name.contains("/0x") || name.contains("/0X");
+        if (found.isEmpty() && !hasHiddenSuffix) {
             String origin = instrumentation != null
                     ? "此前未被游戏加载，已按需加载（未初始化）"
                     : "agent 不可用，通过 Class.forName 获取（未初始化）";
@@ -109,6 +112,21 @@ public final class RuntimeClassInspector {
                     // 这个加载器里没有，继续试下一个
                 } catch (LinkageError error) {
                     failure = error.getClass().getSimpleName() + ": " + error.getMessage();
+                }
+            }
+        }
+        if (found.isEmpty() && instrumentation != null) {
+            String lowerName = name.toLowerCase(Locale.ROOT);
+            for (Class<?> type : instrumentation.getAllLoadedClasses()) {
+                if (type == null || !TransformService.get().isHiddenOrDismantledClass(type)) {
+                    continue;
+                }
+                if (hasHiddenSuffix) {
+                    if (type.getName().toLowerCase(Locale.ROOT).startsWith(lowerName)) {
+                        found.add(new LoadedClass(type, "已加载（按 /0x 隐藏类前缀匹配）"));
+                    }
+                } else if (TransformService.stripHiddenSuffix(type.getName()).equals(name)) {
+                    found.add(new LoadedClass(type, "已加载（具名类未加载，匹配到其运行时 /0x 隐藏类变体）"));
                 }
             }
         }
@@ -130,14 +148,7 @@ public final class RuntimeClassInspector {
     }
 
     private static String normalizeName(String raw) {
-        String name = raw == null ? "" : raw.trim();
-        while (name.startsWith("/")) {
-            name = name.substring(1);
-        }
-        if (name.endsWith(".class")) {
-            name = name.substring(0, name.length() - ".class".length());
-        }
-        return name.replace('/', '.').replace('\\', '.');
+        return TransformService.normalizeClassPatternPreservingHiddenSuffix(raw);
     }
 
     // ── 反射读取成员 ──────────────────────────────────────────────────────
@@ -154,6 +165,20 @@ public final class RuntimeClassInspector {
         builder.append("来源：运行时反射（").append(loaded.origin()).append("），反映反射能看到的运行时成员"
                 + "（可能不完整：类可以把成员从反射里遮住，字节码或编译期直接调用的结果才是最终依据）\n");
         builder.append("加载器：").append(loaderName(type.getClassLoader())).append('\n');
+        Instrumentation instrumentation = InstrumentationAccess.getInstrumentation();
+        if (TransformService.get().isHiddenOrDismantledClass(type)) {
+            boolean modifiable = instrumentation != null && instrumentation.isModifiableClass(type);
+            builder.append("隐藏类状态：").append(modifiable
+                    ? "原为 JVM 隐藏类（带 /0x 后缀），已拆除隐藏标志位（isModifiableClass=true，可直接 runtime_javap 反汇编或 retransform/redefine）\n"
+                    : "JVM 隐藏类（未拆除，isModifiableClass=false；调用 propose_dismantle_hidden_class 可主动拆除，runtime_javap 与 transform 也会自动尝试拆除）\n");
+            String stable = TransformService.stripHiddenSuffix(type.getName());
+            if (!stable.equals(type.getName())) {
+                builder.append("模板类名：").append(stable)
+                        .append("（注意：带 /0x 的运行时类与具名模板类不是同一个 Class，对具名类做 instanceof 永远为 false，请对下方父类链中的基类做 instanceof 或按注册名匹配）\n");
+            }
+        } else if (instrumentation != null && !instrumentation.isModifiableClass(type)) {
+            builder.append("可修改状态：不可修改（isModifiableClass=false）\n");
+        }
         Path source = codeSourcePath(type);
         // 被游戏加载器处理过的类，代码来源常常只是根目录，只有指向具体文件时才有参考价值
         if (source != null && Files.isRegularFile(source)) {
@@ -688,7 +713,12 @@ public final class RuntimeClassInspector {
             throw new IllegalStateException("当前 JVM 不支持 retransform");
         }
         if (!instrumentation.isModifiableClass(type)) {
-            throw new IllegalStateException("该类不允许 retransform（平台内部类、数组或基本类型）：" + type.getName());
+            if (TransformService.get().tryDismantleHiddenClass(instrumentation, type)) {
+                ChatFeedback.info("检测到不可改隐藏类 " + type.getName() + "，已自动拆除隐藏标志位以读取运行时字节码。");
+            }
+        }
+        if (!instrumentation.isModifiableClass(type)) {
+            throw new IllegalStateException("该类不允许 retransform（平台内部类、数组、基本类型或无法拆除的受限隐藏类）：" + type.getName());
         }
         AtomicReference<byte[]> captured = new AtomicReference<>();
         ClassFileTransformer collector = new ClassFileTransformer() {
@@ -836,11 +866,14 @@ public final class RuntimeClassInspector {
         if (instrumentation == null) {
             return "";
         }
-        String prefix = type.getName() + "/";
+        String stableName = TransformService.stripHiddenSuffix(type.getName());
+        String prefix = stableName + "/";
         List<Class<?>> variants = new ArrayList<>();
         try {
             for (Class<?> loaded : instrumentation.getAllLoadedClasses()) {
-                if (loaded.isHidden() && loaded.getName().startsWith(prefix)) {
+                if (loaded != null && loaded != type
+                        && TransformService.get().isHiddenOrDismantledClass(loaded)
+                        && loaded.getName().startsWith(prefix)) {
                     variants.add(loaded);
                 }
             }
@@ -854,11 +887,20 @@ public final class RuntimeClassInspector {
                 .append(" 个以该类名定义的隐藏类（类名带“/0x…”），它们才是运行时真正创建出来的实例所属的类：\n");
         for (Class<?> variant : variants) {
             Class<?> parent = variant.getSuperclass();
-            builder.append("  - ").append(variant.getName()).append("，父类=").append(parent == null ? "（无）" : parent.getName()).append('\n');
+            boolean modifiable = instrumentation.isModifiableClass(variant);
+            builder.append("  - ").append(variant.getName())
+                    .append("，父类=").append(parent == null ? "（无）" : parent.getName())
+                    .append("，状态=").append(modifiable
+                            ? "已拆除隐藏标志（isModifiableClass=true，可直接 runtime_javap / retransform）"
+                            : "未拆除隐藏类（isModifiableClass=false；可调用 propose_dismantle_hidden_class 拆除，或由 runtime_javap / transform 自动拆除）")
+                    .append('\n');
         }
-        builder.append("这些隐藏类和具名类 ").append(type.getName()).append(" 不是同一个类，也不是它的子类，"
-                + "所以 instanceof ").append(simpleName(type)).append(" 对这些实例永远是 false（工具会因此一个目标都找不到）。"
-                + "要匹配它们，请对上面“父类=”所列的类做 instanceof（直接调用该类的 public 方法即可），或者按注册名/EntityType 匹配。\n");
+        int dot = stableName.lastIndexOf('.');
+        String stableSimple = dot >= 0 ? stableName.substring(dot + 1) : stableName;
+        builder.append("这些 /0x 类和具名类 ").append(stableName).append(" 不是同一个类，也不是它的子类，"
+                + "所以 instanceof ").append(stableSimple).append(" 对这些实例永远是 false（工具会因此一个目标都找不到）。"
+                + "要匹配它们，请对上面“父类=”所列的类做 instanceof（直接调用该类的 public 方法即可），或者按注册名/EntityType 匹配；"
+                + "若需要对这些隐藏类做字节码分析或 retransform，可直接指定其 /0x 运行时类名或调用 propose_dismantle_hidden_class。\n");
         return builder.toString();
     }
 

@@ -2,6 +2,7 @@ package com.fangnai.hacker.client.ai.tool;
 
 import com.fangnai.hacker.client.command.ChatFeedback;
 import com.fangnai.hacker.client.config.HackerClientConfig;
+import com.fangnai.hacker.client.transform.TransformService;
 import net.minecraftforge.fml.loading.FMLPaths;
 
 import java.io.ByteArrayOutputStream;
@@ -205,7 +206,7 @@ public final class JarAnalysisService {
         if (classPattern == null || classPattern.isBlank()) {
             throw new IllegalArgumentException("javap_class 需要 classPattern。可先使用 find_class（可不填 jarSelector）查找准确类名。");
         }
-        String normalized = normalizeClassQuery(classPattern);
+        String normalized = TransformService.stripHiddenSuffix(normalizeClassQuery(classPattern));
         String exactEntry = normalized.replace('.', '/') + ".class";
         Path mods = realModsDir();
         List<Path> jars = jarsInMods(mods);
@@ -338,6 +339,7 @@ public final class JarAnalysisService {
             header.append("注意：同名类还存在于 ").append(resolved.lookup().found().size() - 1)
                     .append(" 个其他加载器中，这里读取的是第 1 个（模组/游戏主加载器优先）。\n");
         }
+        boolean wasHiddenLocked = type.isHidden();
         byte[] bytes = null;
         String captureError = "";
         try {
@@ -349,11 +351,24 @@ public final class JarAnalysisService {
             throw new IllegalStateException("无法抓取运行时字节码：" + captureError
                     + "。可改用 mode=runtime_members 读取运行时成员（不需要 agent）。");
         }
+        if (TransformService.get().isHiddenOrDismantledClass(type)) {
+            if (wasHiddenLocked && bytes != null) {
+                header.append("隐藏类状态：检测到不可修改隐藏类，已自动拆除 HotSpot 隐藏标志位并抓取真实字节码（isModifiableClass=true，现已支持 retransform/redefine）\n");
+            } else if (bytes != null) {
+                header.append("隐藏类状态：原为 JVM 隐藏类，已处于拆除可修改状态（isModifiableClass=true）\n");
+            } else {
+                header.append("隐藏类状态：JVM 隐藏类（字节码抓取未成功，可尝试 propose_dismantle_hidden_class）\n");
+            }
+        }
         header.append(bytes != null
                 ? "来源：运行时字节码（对已加载的类做一次不改动字节码的 retransform，抓取 JVM 当前持有的版本）\n"
                 : "来源：运行时反射（抓取运行时字节码失败：" + captureError + "），下面只有成员结构，没有方法体；反射可能被类遮住，结构不一定完整\n");
         Path jar = findJarForLoadedClass(type, jarSelector);
         header.append('\n').append(jarComparison(type, bytes, jar));
+        String hiddenVariantsHint = runtime.describeHiddenVariants(type);
+        if (!hiddenVariantsHint.isBlank()) {
+            header.append(hiddenVariantsHint);
+        }
 
         if (bytes != null) {
             Path file = runtime.saveRuntimeBytes(type, bytes);
@@ -364,9 +379,10 @@ public final class JarAnalysisService {
         }
         StringBuilder text = new StringBuilder(header).append('\n').append(runtime.describeMembers(loaded, ""));
         if (jar != null) {
+            String staticName = TransformService.stripHiddenSuffix(type.getName());
             // 没有 agent 时拿不到运行时方法体，附上 jar 里的 javap 作为参考
-            AnalysisResult staticVersion = runJavap("javap: " + type.getName(),
-                    List.of(resolveJavap().toString(), "-classpath", jar.toString(), "-c", "-p", type.getName()));
+            AnalysisResult staticVersion = runJavap("javap: " + staticName,
+                    List.of(resolveJavap().toString(), "-classpath", jar.toString(), "-c", "-p", staticName));
             text.append("\n附：下面是 jar 静态文件里的方法体，可能与运行时不同：\n")
                     .append(RuntimeClassInspector.filterJavapMembers(staticVersion.content(), memberPattern));
         }
@@ -434,7 +450,7 @@ public final class JarAnalysisService {
 
     /** 找出 mods 目录里包含这个已加载类的 jar：先看调用方指定的，再看类的代码来源，最后逐个 jar 查找。 */
     private Path findJarForLoadedClass(Class<?> type, String jarSelector) {
-        String entry = type.getName().replace('.', '/') + ".class";
+        String entry = TransformService.stripHiddenSuffix(type.getName()).replace('.', '/') + ".class";
         try {
             Path mods = realModsDir();
             if (!isBlank(jarSelector)) {
@@ -468,7 +484,8 @@ public final class JarAnalysisService {
 
     private static byte[] readJarClass(Path jar, String className) throws IOException {
         try (JarFile jarFile = new JarFile(jar.toFile())) {
-            JarEntry entry = jarFile.getJarEntry(className.replace('.', '/') + ".class");
+            String stableName = TransformService.stripHiddenSuffix(className);
+            JarEntry entry = jarFile.getJarEntry(stableName.replace('.', '/') + ".class");
             if (entry == null) {
                 return null;
             }
@@ -603,7 +620,7 @@ public final class JarAnalysisService {
     }
 
     private String resolveSingleClass(Path jar, String pattern) throws Exception {
-        String normalized = normalizeClassQuery(pattern);
+        String normalized = TransformService.stripHiddenSuffix(normalizeClassQuery(pattern));
         String exactEntry = normalized.replace('.', '/') + ".class";
         List<String> matches = new ArrayList<>();
         try (JarFile jarFile = new JarFile(jar.toFile())) {
@@ -706,14 +723,7 @@ public final class JarAnalysisService {
     }
 
     private static String normalizeClassQuery(String value) {
-        String normalized = value == null ? "" : value.trim();
-        while (normalized.startsWith("/")) {
-            normalized = normalized.substring(1);
-        }
-        if (normalized.endsWith(".class")) {
-            normalized = normalized.substring(0, normalized.length() - ".class".length());
-        }
-        return normalized.replace('/', '.').replace('\\', '.');
+        return TransformService.normalizeClassPatternPreservingHiddenSuffix(value);
     }
 
     private static String entryToClassName(String entry) {

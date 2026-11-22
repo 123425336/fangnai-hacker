@@ -206,7 +206,13 @@ public final class ToolRegistry {
     }
 
     public synchronized void recordRecipe(String purpose, String recipeJson, String riskLevel) {
+        recordRecipe(purpose, "default_return_transform", recipeJson, riskLevel);
+    }
+
+    public synchronized void recordRecipe(String purpose, String capability, String recipeJson, String riskLevel) {
         ensureLoaded();
+        String effectiveCapability = capability == null || capability.isBlank()
+                ? "default_return_transform" : capability.trim();
         String id = slug(purpose) + "-" + Integer.toHexString(recipeJson.hashCode());
         Path recipe = root().resolve("recipes").resolve(id + ".json");
         Path doc = root().resolve("docs").resolve(id + ".md");
@@ -219,7 +225,7 @@ public final class ToolRegistry {
             metadata.id = id;
             metadata.name = purpose;
             metadata.purpose = purpose;
-            metadata.capability = "default_return_transform";
+            metadata.capability = effectiveCapability;
             metadata.confirmationPolicy = "transform_requires_confirmation";
             metadata.recipePath = root().relativize(recipe).toString().replace('\\', '/');
             metadata.docPath = root().relativize(doc).toString().replace('\\', '/');
@@ -230,7 +236,7 @@ public final class ToolRegistry {
             metadata.methods = List.of();
             tools.removeIf(tool -> tool.id.equals(id));
             tools.add(metadata);
-            Files.writeString(doc, "# " + purpose + "\n\n- ID: `" + id + "`\n- Capability: `default_return_transform`\n- Confirmation: transform requires confirmation\n- Risk: " + riskLevel + "\n- SHA-256: `" + hash + "`\n\n## Recipe\n\n```json\n" + recipeJson + "\n```\n", StandardCharsets.UTF_8);
+            Files.writeString(doc, "# " + purpose + "\n\n- ID: `" + id + "`\n- Capability: `" + effectiveCapability + "`\n- Confirmation: transform requires confirmation\n- Risk: " + riskLevel + "\n- SHA-256: `" + hash + "`\n\n## Recipe\n\n```json\n" + recipeJson + "\n```\n", StandardCharsets.UTF_8);
             writeRegistryAndReadme();
         } catch (Exception e) {
             ChatFeedback.error("保存工具记录失败：" + e.getMessage());
