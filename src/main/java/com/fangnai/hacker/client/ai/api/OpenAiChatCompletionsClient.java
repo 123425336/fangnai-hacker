@@ -26,6 +26,12 @@ public final class OpenAiChatCompletionsClient extends AbstractJsonAiClient {
         body.add("messages", messagesToJson(request));
         body.add("tools", ToolSchemaJson.openAiTools());
         body.addProperty("tool_choice", "auto");
+        // 流式响应默认不带 usage；要看缓存命中必须显式要求在最后一个数据块里带上
+        if (settings.stream && settings.streamIncludeUsage) {
+            JsonObject streamOptions = new JsonObject();
+            streamOptions.addProperty("include_usage", true);
+            body.add("stream_options", streamOptions);
+        }
         return body;
     }
 

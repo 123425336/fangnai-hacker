@@ -280,7 +280,8 @@ public final class AiConversationManager {
         List<AiMessage> messages = new ArrayList<>();
         messages.add(new AiMessage("system", PromptBuilder.systemPrompt(settings)));
         messages.addAll(snapshotMemoryMessages());
-        messages.add(new AiMessage("user", finalUserPrompt));
+        // 会变化的环境信息放在最后一条用户消息里，保证 “系统提示词 + 历史记忆” 这段前缀在多次请求之间保持一致
+        messages.add(new AiMessage("user", PromptBuilder.volatileContext() + finalUserPrompt));
         return messages;
     }
 
@@ -1105,7 +1106,13 @@ public final class AiConversationManager {
     private synchronized void trimMemory() {
         HackerClientConfig.AiSettings settings = HackerClientConfig.ai();
         int max = Math.max(0, settings.contextMemoryMaxEntries);
-        while (contextMemory.size() > max) {
+        if (contextMemory.size() <= max) {
+            return;
+        }
+        // 超出上限时一次丢掉最旧的一半，而不是每次只丢一条：
+        // 逐条丢弃会让整段历史的开头每一轮都在变，服务端的前缀缓存永远命中不了
+        int keep = max <= 1 ? max : Math.max(1, max / 2);
+        while (contextMemory.size() > keep) {
             contextMemory.removeFirst();
         }
     }

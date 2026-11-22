@@ -75,8 +75,84 @@ abstract class AbstractJsonAiClient implements AiClient {
                     if (AiHttpException.looksLikeHtml(response.body())) {
                         throw new AiHttpException(response.statusCode(), httpRequest.uri(), truncate(response.body(), 120), true);
                     }
+                    logUsage(response.body());
                     return settings.stream && supportsStreaming() ? parseStreamingResponse(response.body()) : parseResponse(response.body());
                 }));
+    }
+
+    /**
+     * 记录这次请求的 token 用量和缓存命中情况（日志里搜 “Token usage”），用来判断前缀缓存到底有没有命中。
+     * 兼容几种常见的字段写法（prompt_tokens_details.cached_tokens、prompt_cache_hit_tokens、cache_read_input_tokens）；
+     * 流式响应取最后一个带 usage 的数据块。解析失败只是不记录，不影响请求。
+     */
+    private void logUsage(String body) {
+        try {
+            JsonObject usage = findUsage(body);
+            if (usage == null) {
+                LOGGER.info("[Fangnai AI] Token usage: 响应里没有 usage 字段（中转站没返回，或流式请求没带 stream_options.include_usage）");
+                return;
+            }
+            long input = firstLong(usage, "prompt_tokens", "input_tokens");
+            long completion = firstLong(usage, "completion_tokens", "output_tokens");
+            JsonObject details = usage.has("prompt_tokens_details") && usage.get("prompt_tokens_details").isJsonObject()
+                    ? usage.getAsJsonObject("prompt_tokens_details")
+                    : usage.has("input_tokens_details") && usage.get("input_tokens_details").isJsonObject()
+                    ? usage.getAsJsonObject("input_tokens_details") : new JsonObject();
+            long cached = Math.max(Math.max(firstLong(details, "cached_tokens"), firstLong(usage, "cached_tokens", "prompt_cache_hit_tokens")),
+                    firstLong(usage, "cache_read_input_tokens"));
+            long created = firstLong(usage, "cache_creation_input_tokens");
+            // 用 cache_read_input_tokens 这种写法的接口，input_tokens 不含缓存读写部分，总输入要加回来
+            long total = usage.has("cache_read_input_tokens") ? input + cached + created : input;
+            LOGGER.info("[Fangnai AI] Token usage: 输入={}，缓存命中={}（{}%），缓存写入={}，输出={}，原始 usage={}",
+                    total, cached, total > 0 ? Math.round(cached * 1000.0D / total) / 10.0D : 0.0D, created, completion, usage);
+        } catch (Throwable ignored) {
+            // 只是诊断信息，解析不了就算了
+        }
+    }
+
+    private JsonObject findUsage(String body) {
+        if (body == null || body.isBlank()) {
+            return null;
+        }
+        String trimmed = body.trim();
+        if (trimmed.startsWith("{")) {
+            JsonElement root = JsonParser.parseString(trimmed);
+            if (root.isJsonObject() && root.getAsJsonObject().has("usage") && root.getAsJsonObject().get("usage").isJsonObject()) {
+                return root.getAsJsonObject().getAsJsonObject("usage");
+            }
+            return null;
+        }
+        JsonObject last = null;
+        for (String line : body.split("\\R")) {
+            String text = line.trim();
+            if (!text.startsWith("data:") || text.contains("[DONE]")) {
+                continue;
+            }
+            try {
+                JsonElement chunk = JsonParser.parseString(text.substring("data:".length()).trim());
+                if (chunk.isJsonObject() && chunk.getAsJsonObject().has("usage")
+                        && chunk.getAsJsonObject().get("usage").isJsonObject()) {
+                    last = chunk.getAsJsonObject().getAsJsonObject("usage");
+                }
+            } catch (Exception ignored) {
+                // 个别数据块不是 JSON，跳过
+            }
+        }
+        return last;
+    }
+
+    private static long firstLong(JsonObject object, String... names) {
+        for (String name : names) {
+            JsonElement element = object.get(name);
+            if (element != null && element.isJsonPrimitive()) {
+                try {
+                    return element.getAsLong();
+                } catch (Exception ignored) {
+                    // 不是数字，试下一个名字
+                }
+            }
+        }
+        return 0L;
     }
 
     private AiResponse withModClassLoader(java.util.function.Supplier<AiResponse> action) {

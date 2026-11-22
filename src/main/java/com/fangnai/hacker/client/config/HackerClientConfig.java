@@ -263,6 +263,9 @@ public final class HackerClientConfig {
         if (!aiRaw.has("promptCachingEnabled")) {
             loaded.ai.promptCachingEnabled = defaults.ai.promptCachingEnabled;
         }
+        if (!aiRaw.has("streamIncludeUsage")) {
+            loaded.ai.streamIncludeUsage = defaults.ai.streamIncludeUsage;
+        }
         if (!aiRaw.has("contextMemoryEnabled")) {
             loaded.ai.contextMemoryEnabled = defaults.ai.contextMemoryEnabled;
         }
@@ -357,6 +360,8 @@ public final class HackerClientConfig {
         public boolean retryOnTransportFailure = true;
         public boolean disableHttpKeepAlive = true;
         public boolean promptCachingEnabled = true;
+        /** 流式请求时要求中转站在最后返回 token 用量（含缓存命中），用来排查缓存命中率；个别不兼容的中转站可以关掉。 */
+        public boolean streamIncludeUsage = true;
         public boolean contextMemoryEnabled = true;
         public int contextMemoryMaxEntries = 20;
         public int contextMemoryEntryMaxChars = 4000;
