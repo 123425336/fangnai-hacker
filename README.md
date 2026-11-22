@@ -521,7 +521,7 @@ config/hacker-client.json
     "model": "",
     "endpointMode": "OPENAI_CHAT_COMPLETIONS",
     "timeoutSeconds": 180,
-    "maxTokens": 8192,
+    "maxTokens": 32768,
     "temperature": 0.2,
     "stream": true,
     "promptCachingEnabled": true

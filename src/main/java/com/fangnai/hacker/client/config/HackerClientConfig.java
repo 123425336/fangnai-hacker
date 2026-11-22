@@ -20,7 +20,8 @@ import java.nio.file.attribute.FileTime;
 import java.util.Locale;
 
 public final class HackerClientConfig {
-    private static final int CURRENT_VERSION = 5;
+    // 版本 6：调大默认的 token 数和各类轮数上限（见 applyMissingDefaults 里的迁移）
+    private static final int CURRENT_VERSION = 6;
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
     private static final Path CONFIG_PATH = FMLPaths.CONFIGDIR.get().resolve("hacker-client.json");
     private static HackerClientConfig INSTANCE;
@@ -182,10 +183,12 @@ public final class HackerClientConfig {
             return;
         }
 
-        if (!aiRaw.has("timeoutSeconds") || (oldVersion < CURRENT_VERSION && loaded.ai.timeoutSeconds == 60)) {
+        // 这三处是版本 5 引入的迁移，条件固定为 “旧于版本 5”，不能跟着 CURRENT_VERSION 走，
+        // 否则每次升版本都会把玩家手动关掉的 stream 之类设置重置回默认值
+        if (!aiRaw.has("timeoutSeconds") || (oldVersion < 5 && loaded.ai.timeoutSeconds == 60)) {
             loaded.ai.timeoutSeconds = defaults.ai.timeoutSeconds;
         }
-        if (!aiRaw.has("maxTokens") || (oldVersion < CURRENT_VERSION && loaded.ai.maxTokens == 1024)) {
+        if (!aiRaw.has("maxTokens") || (oldVersion < 5 && loaded.ai.maxTokens == 1024)) {
             loaded.ai.maxTokens = defaults.ai.maxTokens;
         }
         if (!aiRaw.has("confirmJarAnalysis")) {
@@ -248,7 +251,7 @@ public final class HackerClientConfig {
         if (!aiRaw.has("generatedSourceMaxChars")) {
             loaded.ai.generatedSourceMaxChars = defaults.ai.generatedSourceMaxChars;
         }
-        if (!aiRaw.has("stream") || (oldVersion < CURRENT_VERSION && !loaded.ai.stream)) {
+        if (!aiRaw.has("stream") || (oldVersion < 5 && !loaded.ai.stream)) {
             loaded.ai.stream = defaults.ai.stream;
         }
         if (!aiRaw.has("retryOnTransportFailure")) {
@@ -268,6 +271,35 @@ public final class HackerClientConfig {
         }
         if (!aiRaw.has("contextMemoryEntryMaxChars")) {
             loaded.ai.contextMemoryEntryMaxChars = defaults.ai.contextMemoryEntryMaxChars;
+        }
+
+        // 版本 6：旧默认的 token 数和轮数上限太小，长任务跑不完。
+        // 只迁移“仍然等于旧默认值”的字段；玩家手动改过的值保持不变
+        if (oldVersion < 6) {
+            if (loaded.ai.maxTokens == 8192) {
+                loaded.ai.maxTokens = defaults.ai.maxTokens;
+            }
+            if (loaded.ai.autoRunMaxRounds == 10) {
+                loaded.ai.autoRunMaxRounds = defaults.ai.autoRunMaxRounds;
+            }
+            if (loaded.ai.jarAnalysisWorkflowMaxAnalysisSteps == 5) {
+                loaded.ai.jarAnalysisWorkflowMaxAnalysisSteps = defaults.ai.jarAnalysisWorkflowMaxAnalysisSteps;
+            }
+            if (loaded.ai.jarAnalysisWorkflowMaxAiTurns == 8) {
+                loaded.ai.jarAnalysisWorkflowMaxAiTurns = defaults.ai.jarAnalysisWorkflowMaxAiTurns;
+            }
+            if (loaded.ai.jarAnalysisWorkflowMaxDefineAttempts == 3) {
+                loaded.ai.jarAnalysisWorkflowMaxDefineAttempts = defaults.ai.jarAnalysisWorkflowMaxDefineAttempts;
+            }
+            if (loaded.ai.jarAnalysisWorkflowMaxCompileRepairAttempts == 5) {
+                loaded.ai.jarAnalysisWorkflowMaxCompileRepairAttempts = defaults.ai.jarAnalysisWorkflowMaxCompileRepairAttempts;
+            }
+            if (loaded.ai.jarAnalysisWorkflowResultPreviewChars == 8000) {
+                loaded.ai.jarAnalysisWorkflowResultPreviewChars = defaults.ai.jarAnalysisWorkflowResultPreviewChars;
+            }
+            if (loaded.ai.jarAnalysisWorkflowPromptMaxChars == 24000) {
+                loaded.ai.jarAnalysisWorkflowPromptMaxChars = defaults.ai.jarAnalysisWorkflowPromptMaxChars;
+            }
         }
     }
 
@@ -319,7 +351,7 @@ public final class HackerClientConfig {
         public String systemPrompt = "你是猫娘乐园里的香菜，芳乃 Hacker 的游戏内助手。你可以回答问题，也可以提出需要玩家确认的操作，你的回复需以喵结尾。";
         public EndpointMode endpointMode = EndpointMode.OPENAI_CHAT_COMPLETIONS;
         public int timeoutSeconds = 180;
-        public int maxTokens = 8192;
+        public int maxTokens = 32768;
         public double temperature = 0.2D;
         public boolean stream = true;
         public boolean retryOnTransportFailure = true;
@@ -341,16 +373,17 @@ public final class HackerClientConfig {
         public int jarAnalysisMaxJarMegabytes = 256;
         public boolean jarAnalysisWorkflowEnabled = true;
         // 以下 4 个次数字段已不再作为硬上限使用：工作流出错时会自动把错误交给 AI 重试，只能由玩家手动取消
-        public int jarAnalysisWorkflowMaxAnalysisSteps = 5;
-        public int jarAnalysisWorkflowMaxAiTurns = 8;
-        public int jarAnalysisWorkflowMaxDefineAttempts = 3;
-        public int jarAnalysisWorkflowMaxCompileRepairAttempts = 5;
-        public int jarAnalysisWorkflowResultPreviewChars = 8000;
-        public int jarAnalysisWorkflowPromptMaxChars = 24000;
+        public int jarAnalysisWorkflowMaxAnalysisSteps = 20;
+        public int jarAnalysisWorkflowMaxAiTurns = 30;
+        public int jarAnalysisWorkflowMaxDefineAttempts = 10;
+        public int jarAnalysisWorkflowMaxCompileRepairAttempts = 10;
+        public int jarAnalysisWorkflowResultPreviewChars = 16000;
+        /** 工作流 prompt 的字符上限，超出会从末尾截断（末尾有“下一步只能做什么”的说明），所以不能太小。 */
+        public int jarAnalysisWorkflowPromptMaxChars = 64000;
         /** 确认 define / 执行工具后自动执行，并把结果交给 AI 判断、没达成目标就自动修复。 */
         public boolean autoRunAfterDefine = true;
         /** 一次自动流程最多自动执行多少轮，用完先暂停等玩家说继续；0 表示不限制。 */
-        public int autoRunMaxRounds = 10;
+        public int autoRunMaxRounds = 30;
         /** 执行工具后继续收集聊天栏输出的时间（毫秒），用来捕获工具在服务端线程异步打印的结果。 */
         public int autoRunObserveMillis = 2500;
         public int classDefineMaxBytes = 262144;
@@ -370,7 +403,7 @@ public final class HackerClientConfig {
                 endpointMode = EndpointMode.OPENAI_CHAT_COMPLETIONS;
             }
             timeoutSeconds = Mth.clamp(timeoutSeconds, 10, 600);
-            maxTokens = Mth.clamp(maxTokens, 1, 32768);
+            maxTokens = Mth.clamp(maxTokens, 1, 131072);
             contextMemoryMaxEntries = Mth.clamp(contextMemoryMaxEntries, 0, 100);
             contextMemoryEntryMaxChars = Mth.clamp(contextMemoryEntryMaxChars, 256, 16000);
             temperature = Mth.clamp(temperature, 0.0D, 2.0D);
@@ -380,10 +413,10 @@ public final class HackerClientConfig {
             jarAnalysisMaxOutputChars = Mth.clamp(jarAnalysisMaxOutputChars, 4096, 524288);
             jarAnalysisMaxEntries = Mth.clamp(jarAnalysisMaxEntries, 100, 200000);
             jarAnalysisMaxJarMegabytes = Mth.clamp(jarAnalysisMaxJarMegabytes, 1, 2048);
-            jarAnalysisWorkflowMaxAnalysisSteps = Mth.clamp(jarAnalysisWorkflowMaxAnalysisSteps, 1, 20);
-            jarAnalysisWorkflowMaxAiTurns = Mth.clamp(jarAnalysisWorkflowMaxAiTurns, 1, 30);
-            jarAnalysisWorkflowMaxDefineAttempts = Mth.clamp(jarAnalysisWorkflowMaxDefineAttempts, 1, 10);
-            jarAnalysisWorkflowMaxCompileRepairAttempts = Mth.clamp(jarAnalysisWorkflowMaxCompileRepairAttempts, 0, 20);
+            jarAnalysisWorkflowMaxAnalysisSteps = Mth.clamp(jarAnalysisWorkflowMaxAnalysisSteps, 1, 100);
+            jarAnalysisWorkflowMaxAiTurns = Mth.clamp(jarAnalysisWorkflowMaxAiTurns, 1, 200);
+            jarAnalysisWorkflowMaxDefineAttempts = Mth.clamp(jarAnalysisWorkflowMaxDefineAttempts, 1, 50);
+            jarAnalysisWorkflowMaxCompileRepairAttempts = Mth.clamp(jarAnalysisWorkflowMaxCompileRepairAttempts, 0, 50);
             jarAnalysisWorkflowResultPreviewChars = Mth.clamp(jarAnalysisWorkflowResultPreviewChars, 1024, 65536);
             jarAnalysisWorkflowPromptMaxChars = Mth.clamp(jarAnalysisWorkflowPromptMaxChars, 4096, 131072);
             autoRunMaxRounds = Mth.clamp(autoRunMaxRounds, 0, 100);

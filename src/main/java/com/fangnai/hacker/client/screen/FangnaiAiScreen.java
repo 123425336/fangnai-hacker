@@ -733,7 +733,7 @@ public class FangnaiAiScreen extends Screen {
             g.drawString(font, paramLabels[i], paramLabelX[i], rowY(5) + (rowH - 8) / 2, MUTED, false);
         }
         fieldFrame(g, rTimeout, timeoutBox, "180", mx, my);
-        fieldFrame(g, rTokens, tokensBox, "8192", mx, my);
+        fieldFrame(g, rTokens, tokensBox, "32768", mx, my);
         fieldFrame(g, rTemp, tempBox, "0.2", mx, my);
 
         // 行 6：最终请求地址预览
