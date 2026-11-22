@@ -51,13 +51,17 @@ public final class JarAnalysisProposal extends ActionProposal {
         if (!classPattern.isBlank()) {
             builder.append("，class=").append(classPattern);
         }
+        if (!memberPattern.isBlank()) {
+            builder.append("，member=").append(memberPattern);
+        }
         if (!searchText.isBlank()) {
             builder.append("，search=").append(searchText);
         }
         builder.append("；原因：").append(reason())
                 .append("；效果：").append(expectedEffect());
         switch (mode) {
-            case "runtime_members" -> builder.append("；限制：只读，用反射读取已加载类的成员（可能被类遮住而不完整），不修改游戏");
+            case "runtime_members" -> builder.append("；限制：只读，用反射读取已加载类的成员，不修改游戏；"
+                    + "反射一个匹配成员都找不到时，会补一次不改动字节码的 retransform 抓取字节码来核实（反射可能被类遮住）");
             case "runtime_javap" -> builder.append("；限制：只读，会对该类做一次不改动字节码的 retransform 来抓取运行时字节码，timeout=")
                     .append(ai.jarAnalysisTimeoutSeconds).append("s");
             case "javap_class" -> builder.append("；限制：类已加载时优先读取运行时版本并与 jar 对比，否则读 mods 目录 jar，timeout=")
@@ -66,10 +70,9 @@ public final class JarAnalysisProposal extends ActionProposal {
         }
         builder.append("，output<=").append(ai.jarAnalysisMaxOutputChars).append(" chars");
         if (ai.jarAnalysisWorkflowEnabled) {
-            builder.append("；确认后会在限制内自动继续分析/请求 AI/编译并 define 生成类")
-                    .append("，analysisSteps<=").append(ai.jarAnalysisWorkflowMaxAnalysisSteps)
-                    .append("，aiTurns<=").append(ai.jarAnalysisWorkflowMaxAiTurns)
-                    .append("，defineAttempts<=").append(ai.jarAnalysisWorkflowMaxDefineAttempts);
+            // 分析步数/AI 轮数/define 次数已经不是硬上限：出错会自动交回 AI 重试，玩家随时可以点停止；
+            // 这里不再写 “<=N”，否则模型会把它当成固定额度，用完就以“额度用完”为由放弃
+            builder.append("；确认后会自动继续分析/请求 AI/编译并 define 生成类，没有固定的步数额度，玩家可随时在 GUI 点停止");
         }
         return builder.toString();
     }

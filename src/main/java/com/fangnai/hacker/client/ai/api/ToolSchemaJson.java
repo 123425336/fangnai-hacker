@@ -67,7 +67,8 @@ public final class ToolSchemaJson {
                         + "javap_class 在类已加载时也会自动读运行时版本并和 jar 对比差异，未加载时才读 jar。直接调用前不确定成员名字或参数类型，先用 runtime_members 确认。")
                 .string("jarSelector", "mods 目录下 jar 文件名或唯一匹配片段；list_jars 可留空；find_class、javap_class 及 runtime_* 留空时会自动搜索（runtime_* 只用它来选择对比的 jar）；list_entries、manifest 必须填写。禁止绝对路径和 ..。")
                 .string("classPattern", "类名、包名或唯一匹配片段；javap_class、runtime_* 需要能解析到单个类，runtime_* 请尽量给完整类名。")
-                .string("memberPattern", "可选：runtime_members 按成员名片段过滤（同时列出父类里匹配的成员）；其他模式仅用于说明。")
+                .string("memberPattern", "可选：按成员名片段过滤。runtime_members 只列出匹配的成员（同时列出父类里匹配的成员；反射里一个都没有时会自动用运行时字节码核实）；"
+                        + "runtime_javap / javap_class 只返回匹配成员的反汇编，大类里要看某个方法时务必填它，否则输出可能被截断。")
                 .string("searchText", "可选搜索文本；find_class 可用。")
                 .string("reason", "为什么需要分析这个 jar。")
                 .string("expectedEffect", "预期从分析中获得什么信息；在自动工作流中每次只请求一个必要的下一步分析。")

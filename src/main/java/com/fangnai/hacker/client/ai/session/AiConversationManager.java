@@ -864,7 +864,7 @@ public final class AiConversationManager {
         JarWorkflowContext next = context.withAiTurns(context.aiTurns() + 1).withPhase("ai_continuation")
                 .withLastAnalysis(result.title())
                 .withLastAnalysisContext("完整输出路径：" + result.outputPath() + "\n分析内容预览：\n"
-                        + truncate(result.content(), settings.jarAnalysisWorkflowResultPreviewChars));
+                        + analysisPreview(result.content(), settings.jarAnalysisWorkflowResultPreviewChars));
         jarWorkflowContext.set(next);
         String prompt = buildWorkflowContinuationPrompt(next, result);
         if (prompt.length() > settings.jarAnalysisWorkflowPromptMaxChars) {
@@ -1221,7 +1221,7 @@ public final class AiConversationManager {
                 + ", defineAttempts=" + context.defineAttempts() + ", repairs=" + context.compileRepairs() + "\n\n"
                 + "刚完成的分析：" + result.title() + "\n"
                 + "完整输出路径：" + result.outputPath() + "\n"
-                + "分析内容预览：\n```text\n" + truncate(result.content(), settings.jarAnalysisWorkflowResultPreviewChars) + "\n```\n\n"
+                + "分析内容预览：\n```text\n" + analysisPreview(result.content(), settings.jarAnalysisWorkflowResultPreviewChars) + "\n```\n\n"
                 + (context.lastRunReport().isBlank() ? "" : "最近一次自动执行结果：\n" + truncate(context.lastRunReport(), 6000) + "\n")
                 + workflowOptions(context);
     }
@@ -1245,9 +1245,14 @@ public final class AiConversationManager {
             builder.append("- 只是执行的方法选错了：调用 execute_saved_tool，toolId 用当前工具，input={\"method\":\"方法名\"}，系统会自动执行；\n");
             builder.append("- 最近一次执行结果已经明确证明目标达成：以“").append(GOAL_DONE_MARKER).append("”开头，用文字说明证据；\n");
         }
-        builder.append("- 确实无法继续：以“").append(WORKFLOW_GIVE_UP_MARKER).append("”开头说明具体原因。\n");
+        builder.append("- 确实无法继续：以“").append(WORKFLOW_GIVE_UP_MARKER).append("”开头说明具体原因。"
+                + "只有已经用编译期直接调用实际试过并失败、而且确实没有别的办法可试时才能这样结束；"
+                + "“预览被截断”“还没看到方法体”“证据不足”都不是放弃的理由：缺细节就再提 propose_jar_analysis 用 memberPattern 取具体成员，"
+                + "或者直接写一个最小的调用试验工具执行一次，执行结果就是证据。\n");
         builder.append("限制：不要调用无关工具；不要声称未执行的操作已经完成；生成类必须在 package com.fangnai.hacker.generated；"
-                + "修复同一工具必须复用同一 className，不要生成 V2/V3/New 后缀类名。");
+                + "修复同一工具必须复用同一 className，不要生成 V2/V3/New 后缀类名。"
+                + "分析步数和 AI 轮数没有固定额度（进度里的数字只是计数），不要以“额度用完”为由放弃；"
+                + "你读不到磁盘上的分析文件，也不要让玩家粘贴报告，需要细节就再提 propose_jar_analysis。");
         return builder.toString();
     }
 
@@ -1270,6 +1275,8 @@ public final class AiConversationManager {
                 + truncate(inspection == null ? "" : inspection.toPromptText(), 16000) + "\n```\n\n"
                 + "判断标准：只有返回值或聊天输出里有明确证据表明目标已经实现（例如目标数值确实变成了预期值、目标数量大于 0 且全部处理成功），才算达成；"
                 + "“已排队”“queued”“已提交”之类没有结果的输出不算证据，找到的目标数为 0 也不算达成。\n"
+                + "目标数为 0 时：不要只在维度、线程、权限上反复猜。先在返回值里列出该范围内所有实体的运行时类名（getClass().getName()）和注册名，"
+                + "再据此改匹配条件；模组的实体可能是隐藏类（类名带“/0x…”），它和具名类不是同一个类，instanceof 具名子类会一个都匹配不到，应改用它的父类（基类）做 instanceof，或按注册名匹配。\n"
                 + "修复建议：不要吞掉异常，把 e.toString() 和关键上下文写进返回值或直接抛出；需要在单人游戏服务端线程执行的操作，"
                 + "用 server.submit(() -> ...).get(5, TimeUnit.SECONDS) 同步拿到结果再返回，不要只 execute 后立即返回；"
                 + "方法/字段找不到时，先区分错误类型：……Error（JVM 链接错误）说明运行时确实没有；……Exception（反射异常）只说明反射看不到，"
@@ -1403,6 +1410,20 @@ public final class AiConversationManager {
             return "";
         }
         return value.length() <= max ? value : value.substring(0, Math.max(0, max)) + "...";
+    }
+
+    /**
+     * 给 AI 看的分析预览：被截断时明确告诉它只看到了前一部分，以及怎么拿到想看的部分。
+     * AI 读不到磁盘上的完整文件，也不该让玩家去粘贴报告。
+     */
+    private static String analysisPreview(String content, int max) {
+        String value = content == null ? "" : content;
+        if (value.length() <= max) {
+            return value;
+        }
+        return value.substring(0, Math.max(0, max)) + "\n...（预览已截断：完整输出共 " + value.length() + " 字符，这里只给了前 " + max
+                + " 字符。你读不到磁盘上的完整文件，也不要让玩家粘贴报告；要看某个具体方法或字段，请再提一次 propose_jar_analysis，"
+                + "用 memberPattern 只取那个成员，runtime_javap / javap_class 会只返回匹配成员的反汇编。）";
     }
 
     private record CompileRepairContext(String className, int attempt) {

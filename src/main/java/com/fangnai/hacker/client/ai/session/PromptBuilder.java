@@ -22,6 +22,11 @@ public final class PromptBuilder {
                 + "runtime_members 用反射读取运行时的字段/方法/构造器（带参数类型和 JVM 描述符，memberPattern 可按名字过滤并包含父类，只读无副作用）；"
                 + "runtime_javap 抓取运行时字节码后反汇编；javap_class 在类已加载时也会自动读运行时版本，并和 jar 对比出差异。"
                 + "写直接调用或修复 NoSuchMethod/NoSuchField 之前，先用 runtime_members 确认成员的名字和参数类型，不要凭 jar 猜。\n");
+        prompt.append("先试后问：找到公开的调用入口（public 方法、public static 方法）后，直接写编译期调用的最小试验工具并执行一次，执行结果就是最好的证据；"
+                + "不要在没试过的情况下要求先看到完整的方法体或反汇编，也不要因为预览被截断就放弃。"
+                + "你读不到分析输出保存在磁盘上的文件，更不要让玩家粘贴报告：需要某个方法或字段的细节，就用 propose_jar_analysis 并填 memberPattern 只取那个成员"
+                + "（runtime_members 和 runtime_javap / javap_class 都支持，javap 只返回匹配成员的反汇编）。"
+                + "protected/private 的成员生成类不能直接调用，优先找 public 的入口方法；工作流里只有已经直接调用试过且失败、并且确实没有别的办法时，才以“无法继续：”结束。\n");
         prompt.append("反射的结果可能不完整：类可以把成员从反射里遮住，而这些成员在 JVM 里照样存在、编译期直接调用照样能成功。"
                 + "所以 runtime_members 显示“jar 里有、反射里没有”时，不能据此断定运行时没有这个成员，更不能因此放弃或换成偷懒的方案："
                 + "要么用 runtime_javap 读运行时字节码（不受遮蔽影响），要么写编译期直接调用实际试一次，并把 e.toString() 写进返回值。"

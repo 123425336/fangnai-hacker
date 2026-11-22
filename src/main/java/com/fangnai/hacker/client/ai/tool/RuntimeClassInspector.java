@@ -9,6 +9,7 @@ import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.FieldVisitor;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
+import org.objectweb.asm.Type;
 
 import java.io.IOException;
 import java.lang.instrument.ClassFileTransformer;
@@ -721,6 +722,231 @@ public final class RuntimeClassInspector {
         Path file = dir.resolve(type.getName().replaceAll("[^A-Za-z0-9._$-]", "_") + ".class");
         Files.write(file, bytes);
         return file;
+    }
+
+    // ── 反射被遮住时：用运行时字节码核实 ──────────────────────────────────
+
+    /** 类自己声明的、名字匹配过滤词的字段和普通方法（不含构造器）在反射里有多少个；读取失败按 0 算。 */
+    public static int reflectedMatchCount(Class<?> type, String memberFilter) {
+        String filter = memberFilter == null ? "" : memberFilter.trim().toLowerCase(Locale.ROOT);
+        int count = 0;
+        try {
+            for (Field field : type.getDeclaredFields()) {
+                if (matches(field.getName(), filter)) {
+                    count++;
+                }
+            }
+        } catch (Throwable ignored) {
+            // 某个成员的类型解析失败时，当作反射读不到
+        }
+        try {
+            for (Method method : type.getDeclaredMethods()) {
+                if (matches(method.getName(), filter)) {
+                    count++;
+                }
+            }
+        } catch (Throwable ignored) {
+            // 同上
+        }
+        return count;
+    }
+
+    /** 能用字节码核实的类：JDK 平台类、数组和基本类型不处理，避免无谓的 retransform。 */
+    public static boolean canVerifyByBytecode(Class<?> type) {
+        return !isPlatformClass(type) && !type.isArray() && !type.isPrimitive();
+    }
+
+    /** 从字节码里列出名字匹配过滤词的字段和普通方法（带修饰符、参数类型和描述符），不受反射遮蔽影响。 */
+    public static List<String> memberLinesFromBytes(byte[] bytes, String memberFilter) {
+        String filter = memberFilter == null ? "" : memberFilter.trim().toLowerCase(Locale.ROOT);
+        TreeMap<String, String> lines = new TreeMap<>();
+        new ClassReader(bytes).accept(new ClassVisitor(Opcodes.ASM9) {
+            @Override
+            public FieldVisitor visitField(int access, String name, String descriptor, String signature, Object value) {
+                if (matches(name, filter)) {
+                    lines.put("0" + name + ":" + descriptor,
+                            "- " + join(Modifier.toString(access & Modifier.fieldModifiers()), Type.getType(descriptor).getClassName())
+                                    + " " + name + devSuffix(name) + "    " + name + ":" + descriptor);
+                }
+                return null;
+            }
+
+            @Override
+            public MethodVisitor visitMethod(int access, String name, String descriptor, String signature, String[] exceptions) {
+                if (!name.startsWith("<") && matches(name, filter)) {
+                    String params = Arrays.stream(Type.getArgumentTypes(descriptor)).map(Type::getClassName)
+                            .collect(Collectors.joining(", "));
+                    String flags = ((access & Opcodes.ACC_SYNTHETIC) != 0 ? " [synthetic]" : "")
+                            + ((access & Opcodes.ACC_BRIDGE) != 0 ? " [bridge]" : "");
+                    lines.put("1" + name + descriptor,
+                            "- " + join(Modifier.toString(access & Modifier.methodModifiers()), Type.getReturnType(descriptor).getClassName())
+                                    + " " + name + "(" + params + ")" + flags + devSuffix(name) + "    " + name + descriptor);
+                }
+                return null;
+            }
+        }, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+        return new ArrayList<>(lines.values());
+    }
+
+    /**
+     * 反射里没有找到（匹配的）成员时，抓一次运行时字节码来核实：
+     * 字节码里有，说明成员只是被反射遮住了，实际存在、可以编译期直接调用；字节码里也没有，才说明它确实不存在。
+     * 抓取会对该类做一次不改动字节码的 retransform；没有 agent 或抓取失败时只说明核实失败。
+     */
+    public String verifyMissingByBytecode(Class<?> type, String memberFilter) {
+        String filter = memberFilter == null ? "" : memberFilter.trim();
+        StringBuilder builder = new StringBuilder("\n【系统核实】反射里没有找到")
+                .append(filter.isEmpty() ? "任何字段或方法" : "名字包含“" + filter + "”的字段或方法")
+                .append("，所以对该类抓了一次运行时字节码来核实（做了一次不改动字节码的 retransform）：\n");
+        try {
+            byte[] bytes = captureRuntimeBytes(type);
+            if (bytes == null) {
+                return builder.append("没有抓到字节码，无法核实。\n").toString();
+            }
+            List<String> lines = memberLinesFromBytes(bytes, memberFilter);
+            if (lines.isEmpty()) {
+                return builder.append("字节码里该类自己声明的成员里也没有匹配项，说明它确实不在这个类里"
+                        + "（继承来的成员见上面的父类部分，或者去父类里查）。\n").toString();
+            }
+            builder.append("字节码里有 ").append(lines.size()).append(" 个匹配的成员，说明它们只是被反射遮住了，"
+                    + "运行时实际存在，可以用编译期直接调用（不要用反射）。修饰符以这里为准：\n");
+            int shown = Math.min(lines.size(), MAX_LINES_PER_SECTION);
+            for (int i = 0; i < shown; i++) {
+                builder.append("  ").append(lines.get(i)).append('\n');
+            }
+            if (lines.size() > shown) {
+                builder.append("  ... 另有 ").append(lines.size() - shown).append(" 项未显示，可用 memberPattern 按名字过滤。\n");
+            }
+            return builder.toString();
+        } catch (Throwable throwable) {
+            return builder.append("核实失败：").append(throwable.getClass().getSimpleName()).append(": ")
+                    .append(throwable.getMessage()).append("。无法确定它是否真的不存在，请用编译期直接调用试一次。\n").toString();
+        }
+    }
+
+    // ── 隐藏类：运行时真正创建出来的实例所属的类 ──────────────────────────────
+
+    /**
+     * 找出以目标类为名定义的隐藏类（类名形如“目标类/0x…”）。
+     * 有的类会在运行时用隐藏类重新定义自己再创建实例：这些隐藏类不是具名类的子类，
+     * 对具名类做 instanceof 永远是 false，工具会因此“一个目标都找不到”。没有 agent 或没有隐藏类时返回空串。
+     */
+    public String describeHiddenVariants(Class<?> type) {
+        Instrumentation instrumentation = InstrumentationAccess.getInstrumentation();
+        if (instrumentation == null) {
+            return "";
+        }
+        String prefix = type.getName() + "/";
+        List<Class<?>> variants = new ArrayList<>();
+        try {
+            for (Class<?> loaded : instrumentation.getAllLoadedClasses()) {
+                if (loaded.isHidden() && loaded.getName().startsWith(prefix)) {
+                    variants.add(loaded);
+                }
+            }
+        } catch (Throwable ignored) {
+            return "";
+        }
+        if (variants.isEmpty()) {
+            return "";
+        }
+        StringBuilder builder = new StringBuilder("\n【系统提醒】运行时还存在 ").append(variants.size())
+                .append(" 个以该类名定义的隐藏类（类名带“/0x…”），它们才是运行时真正创建出来的实例所属的类：\n");
+        for (Class<?> variant : variants) {
+            Class<?> parent = variant.getSuperclass();
+            builder.append("  - ").append(variant.getName()).append("，父类=").append(parent == null ? "（无）" : parent.getName()).append('\n');
+        }
+        builder.append("这些隐藏类和具名类 ").append(type.getName()).append(" 不是同一个类，也不是它的子类，"
+                + "所以 instanceof ").append(simpleName(type)).append(" 对这些实例永远是 false（工具会因此一个目标都找不到）。"
+                + "要匹配它们，请对上面“父类=”所列的类做 instanceof（直接调用该类的 public 方法即可），或者按注册名/EntityType 匹配。\n");
+        return builder.toString();
+    }
+
+    // ── javap 输出按成员过滤 ──────────────────────────────────────────────
+
+    private static final Pattern JAVAP_IDENT = Pattern.compile("[A-Za-z_$][\\w$.]*");
+
+    /**
+     * 只保留 javap 输出里名字匹配的成员块（字段/方法及其字节码），其余成员省略，
+     * 避免大类的反汇编预览被无关方法占满、关键方法被截断。memberPattern 为空或输出结构无法识别时原样返回。
+     */
+    public static String filterJavapMembers(String javapText, String memberPattern) {
+        String filter = memberPattern == null ? "" : memberPattern.trim().toLowerCase(Locale.ROOT);
+        if (filter.isEmpty() || javapText == null) {
+            return javapText;
+        }
+        String[] lines = javapText.split("\r?\n", -1);
+        int classStart = -1;
+        for (int i = 0; i < lines.length; i++) {
+            String line = lines[i];
+            if (!line.isEmpty() && line.charAt(0) != ' ' && line.endsWith("{") && !line.startsWith("Command:")) {
+                classStart = i;
+                break;
+            }
+        }
+        int classEnd = -1;
+        for (int i = lines.length - 1; i > classStart && classStart >= 0; i--) {
+            if (lines[i].equals("}")) {
+                classEnd = i;
+                break;
+            }
+        }
+        if (classStart < 0 || classEnd < 0) {
+            return javapText;
+        }
+        StringBuilder preamble = new StringBuilder();
+        for (int i = 0; i <= classStart; i++) {
+            preamble.append(lines[i]).append('\n');
+        }
+        StringBuilder body = new StringBuilder();
+        List<String> allNames = new ArrayList<>();
+        int total = 0;
+        int kept = 0;
+        boolean keep = false;
+        for (int i = classStart + 1; i < classEnd; i++) {
+            String line = lines[i];
+            if (line.length() > 2 && line.startsWith("  ") && line.charAt(2) != ' ') {
+                total++;
+                String name = javapMemberName(line);
+                allNames.add(name);
+                keep = !name.isEmpty() && matches(name, filter);
+                if (keep) {
+                    kept++;
+                    body.append(line).append(devSuffix(name).isEmpty() ? "" : "    //" + devSuffix(name)).append('\n');
+                    continue;
+                }
+            }
+            if (keep) {
+                body.append(line).append('\n');
+            }
+        }
+        StringBuilder out = new StringBuilder(preamble);
+        out.append("【已按 memberPattern=“").append(memberPattern.trim()).append("”过滤：只显示名字匹配的 ")
+                .append(kept).append(" 个成员，该类共 ").append(total).append(" 个成员，其余已省略】\n");
+        if (kept == 0) {
+            out.append("没有名字匹配的成员。该类里的成员名有：")
+                    .append(String.join("、", allNames.subList(0, Math.min(allNames.size(), 120)))).append('\n');
+        }
+        out.append(body).append("}\n");
+        for (int i = classEnd + 1; i < lines.length; i++) {
+            if (!lines[i].isEmpty() || i < lines.length - 1) {
+                out.append(lines[i]).append('\n');
+            }
+        }
+        return out.toString();
+    }
+
+    /** 从 javap 的成员声明行里取出成员名：方法取括号前的最后一个词，字段取分号前的最后一个词。 */
+    private static String javapMemberName(String headerLine) {
+        String header = headerLine.trim();
+        int paren = header.indexOf('(');
+        String head = paren >= 0 ? header.substring(0, paren) : header.replace(";", "");
+        Matcher matcher = JAVAP_IDENT.matcher(head);
+        String last = "";
+        while (matcher.find()) {
+            last = matcher.group();
+        }
+        return last;
     }
 
     // ── 失败时自动附带运行时结构 ──────────────────────────────────────────

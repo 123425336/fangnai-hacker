@@ -82,8 +82,8 @@ public final class JarAnalysisService {
                     ? findClassInAllJars(firstNonBlank(classPattern, searchText))
                     : findClass(resolveJar(jarSelector), firstNonBlank(classPattern, searchText));
             // javap_class：类已加载时优先读运行时版本，并和 jar 对比；没加载或没有 agent 时退回读 jar
-            case "javap_class" -> javapAuto(jarSelector, classPattern, false);
-            case "runtime_javap" -> javapAuto(jarSelector, classPattern, true);
+            case "javap_class" -> javapAuto(jarSelector, classPattern, false, memberPattern);
+            case "runtime_javap" -> javapAuto(jarSelector, classPattern, true, memberPattern);
             case "runtime_members" -> runtimeMembers(jarSelector, classPattern, memberPattern);
             default -> throw new IllegalArgumentException("不支持的 jar 分析模式：" + rawMode);
         };
@@ -304,8 +304,10 @@ public final class JarAnalysisService {
     /**
      * javap_class / runtime_javap：已加载的类优先读取运行时版本（抓取运行时字节码后反汇编，并和 jar 对比差异）。
      * 类没有加载或 agent 不可用时：javap_class 退回读 jar 静态文件，runtime_javap（runtimeOnly）直接报错。
+     * memberPattern 不为空时只保留名字匹配的成员的反汇编，大类也不会因为预览被截断而看不到目标方法。
      */
-    private AnalysisResult javapAuto(String jarSelector, String classPattern, boolean runtimeOnly) throws Exception {
+    private AnalysisResult javapAuto(String jarSelector, String classPattern, boolean runtimeOnly,
+                                     String memberPattern) throws Exception {
         if (isBlank(classPattern)) {
             throw new IllegalArgumentException("javap_class 需要 classPattern。可先使用 find_class（可不填 jarSelector）查找准确类名。");
         }
@@ -322,7 +324,8 @@ public final class JarAnalysisService {
             }
             AnalysisResult fallback = javapClass(resolved.staticJar(), classPattern);
             return new AnalysisResult(fallback.title(), "来源：jar 静态文件。" + runtimeNotFound(resolved.name(), resolved.lookup())
-                    + "下面是 jar 里的版本，可能与游戏里实际运行的不同。\n\n" + fallback.content());
+                    + "下面是 jar 里的版本，可能与游戏里实际运行的不同。\n\n"
+                    + RuntimeClassInspector.filterJavapMembers(fallback.content(), memberPattern));
         }
 
         RuntimeClassInspector.LoadedClass loaded = resolved.lookup().found().get(0);
@@ -356,14 +359,16 @@ public final class JarAnalysisService {
             Path file = runtime.saveRuntimeBytes(type, bytes);
             AnalysisResult javap = runJavap("javap(runtime): " + type.getName(),
                     List.of(resolveJavap().toString(), "-c", "-p", file.toString()));
-            return new AnalysisResult(javap.title(), limitOutput(header + "\n" + javap.content()));
+            return new AnalysisResult(javap.title(), limitOutput(header + "\n"
+                    + RuntimeClassInspector.filterJavapMembers(javap.content(), memberPattern)));
         }
         StringBuilder text = new StringBuilder(header).append('\n').append(runtime.describeMembers(loaded, ""));
         if (jar != null) {
             // 没有 agent 时拿不到运行时方法体，附上 jar 里的 javap 作为参考
             AnalysisResult staticVersion = runJavap("javap: " + type.getName(),
                     List.of(resolveJavap().toString(), "-classpath", jar.toString(), "-c", "-p", type.getName()));
-            text.append("\n附：下面是 jar 静态文件里的方法体，可能与运行时不同：\n").append(staticVersion.content());
+            text.append("\n附：下面是 jar 静态文件里的方法体，可能与运行时不同：\n")
+                    .append(RuntimeClassInspector.filterJavapMembers(staticVersion.content(), memberPattern));
         }
         return new AnalysisResult("javap(runtime-members): " + type.getName(), limitOutput(text.toString()));
     }
@@ -387,6 +392,13 @@ public final class JarAnalysisService {
             }
             builder.append(runtime.describeMembers(loaded, memberPattern)).append('\n');
             builder.append(jarComparison(loaded.type(), null, findJarForLoadedClass(loaded.type(), jarSelector)));
+            // 反射被类遮住时，会一个匹配的成员都看不到；这时用运行时字节码核实，给出“确实不存在”或“只是被遮住”的明确结论
+            if (RuntimeClassInspector.canVerifyByBytecode(loaded.type())
+                    && RuntimeClassInspector.reflectedMatchCount(loaded.type(), memberPattern) == 0) {
+                builder.append(runtime.verifyMissingByBytecode(loaded.type(), memberPattern));
+            }
+            // 运行时实例可能属于以该类名定义的隐藏类，instanceof 具名类会匹配不到，提前告诉 AI
+            builder.append(runtime.describeHiddenVariants(loaded.type()));
         }
         if (list.size() > 3) {
             builder.append("\n... 另有 ").append(list.size() - 3).append(" 个同名类未显示。\n");
