@@ -90,8 +90,18 @@ public final class AiConversationManager {
     private volatile long lastProgressLogMillis;
     /** 下一次自动重试的时间点（毫秒），没有待重试请求时为 0。 */
     private volatile long retryAtMillis;
+    /**
+     * 已经成功拆除过隐藏类的工作流 id。拆除之后香草往往还会再做一两步复查（runtime_members / runtime_javap），
+     * 那时 lastAnalysis 已经被覆盖，不能再靠它判断“有没有拆除过”，所以单独记下来，免得她明明说了“目标已达成”却被当成无效回复而空转。
+     */
+    private volatile String dismantledWorkflowId = "";
 
     private AiConversationManager() {
+    }
+
+    /** 这个工作流是否已经有可以证明目标达成的真实结果：执行过工具，或者成功拆除过隐藏类。 */
+    private boolean workflowHasEvidence(JarWorkflowContext context) {
+        return context.runRounds() > 0 || context.workflowId().equals(dismantledWorkflowId);
     }
 
     public static AiConversationManager get() {
@@ -726,8 +736,7 @@ public final class AiConversationManager {
                 if (workflow != null) {
                     flushBatchProposals(batchPendingProposals);
                     ChatFeedback.answer(response.content());
-                    if ((workflow.runRounds() > 0 || workflow.lastAnalysis().startsWith("dismantle hidden:"))
-                            && response.content().contains(GOAL_DONE_MARKER)) {
+                    if (workflowHasEvidence(workflow) && response.content().contains(GOAL_DONE_MARKER)) {
                         // AI 根据真实执行结果或隐藏类拆除结果确认目标已实现：自动流程正常结束
                         appendMemory("assistant", response.content());
                         finishWorkflow(workflow, true, workflow.runRounds() > 0
@@ -1041,6 +1050,9 @@ public final class AiConversationManager {
     private void runWorkflowDismantleHiddenClass(JarWorkflowContext context, DismantleHiddenClassProposal proposal) {
         ChatFeedback.info("自动流程正在拆除隐藏类：target=" + proposal.targetPattern());
         TransformService.DismantleResult result = proposal.executeResult();
+        if (result.success()) {
+            dismantledWorkflowId = context.workflowId();
+        }
         String report = result.toPromptReport();
         HackerClientConfig.AiSettings settings = HackerClientConfig.ai();
         JarWorkflowContext next = context.withAnalysisSteps(context.analysisSteps() + 1)
@@ -1582,7 +1594,7 @@ public final class AiConversationManager {
         if (context.runRounds() > 0) {
             builder.append("- 只是执行的方法选错了：调用 execute_saved_tool，toolId 用当前工具，input={\"method\":\"方法名\"}，系统会自动执行；\n");
         }
-        if (context.runRounds() > 0 || context.lastAnalysis().startsWith("dismantle hidden:")) {
+        if (workflowHasEvidence(context)) {
             builder.append("- 最近一次执行或拆除结果已经明确证明目标达成：以“").append(GOAL_DONE_MARKER).append("”开头，用文字说明证据；\n");
         }
         builder.append("- 确实无法继续：以“").append(WORKFLOW_GIVE_UP_MARKER).append("”开头说明具体原因。"

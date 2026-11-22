@@ -5,12 +5,14 @@ import com.fangnai.hacker.client.command.ChatFeedback;
 import com.fangnai.hacker.client.instrument.InstrumentationAccess;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
+import com.mojang.logging.LogUtils;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
 import net.minecraftforge.fml.loading.FMLPaths;
+import org.slf4j.Logger;
 
 import java.lang.instrument.ClassFileTransformer;
 import java.lang.instrument.ClassDefinition;
@@ -41,6 +43,7 @@ import java.util.regex.PatternSyntaxException;
 import java.util.stream.Stream;
 
 public final class TransformService {
+    private static final Logger LOGGER = LogUtils.getLogger();
     private static final TransformService INSTANCE = new TransformService();
     private static final int MAX_TARGETS = 500;
     private static final long HOTSPOT_17_CLASS_KLASS_OFFSET = 16L;
@@ -378,16 +381,21 @@ public final class TransformService {
             return DismantleClassOutcome.NOT_HIDDEN_OR_INELIGIBLE;
         }
         if (!supportsHotSpot17HiddenFlagAccess()) {
+            LOGGER.warn("[Fangnai AI] Dismantle skipped for {}: this JVM does not support the HotSpot 17 hidden-flag access.", runtimeName);
             return DismantleClassOutcome.UNSUPPORTED_OR_FAILED;
         }
         try {
             long klass = UNSAFE.getLong(type, HOTSPOT_17_CLASS_KLASS_OFFSET);
             if (klass == 0L || (klass & 0x7L) != 0L) {
+                LOGGER.warn("[Fangnai AI] Dismantle failed for {}: unexpected klass pointer 0x{} read at mirror offset {}.",
+                        runtimeName, Long.toHexString(klass), HOTSPOT_17_CLASS_KLASS_OFFSET);
                 return DismantleClassOutcome.UNSUPPORTED_OR_FAILED;
             }
             long flagsAddress = klass + HOTSPOT_17_KLASS_FLAGS_OFFSET;
             int flags = UNSAFE.getInt(flagsAddress);
             if ((flags & HOTSPOT_HIDDEN_CLASS_FLAG) == 0) {
+                LOGGER.warn("[Fangnai AI] Dismantle failed for {}: the hidden-class bit is not set in klass flags 0x{} (klass=0x{}, flagsOffset={}, isHidden={}).",
+                        runtimeName, Integer.toHexString(flags), Long.toHexString(klass), HOTSPOT_17_KLASS_FLAGS_OFFSET, type.isHidden());
                 return DismantleClassOutcome.UNSUPPORTED_OR_FAILED;
             }
             UNSAFE.putInt(flagsAddress, flags & ~HOTSPOT_HIDDEN_CLASS_FLAG);
@@ -398,8 +406,11 @@ public final class TransformService {
             }
             UNSAFE.putInt(flagsAddress, flags);
             UNSAFE.fullFence();
+            LOGGER.warn("[Fangnai AI] Dismantle failed for {}: the class is still not modifiable after clearing the hidden bit (flags 0x{}), the bit was restored.",
+                    runtimeName, Integer.toHexString(flags));
             return DismantleClassOutcome.UNSUPPORTED_OR_FAILED;
-        } catch (Throwable ignored) {
+        } catch (Throwable throwable) {
+            LOGGER.warn("[Fangnai AI] Dismantle failed for {}: {}", runtimeName, throwable.toString());
             return DismantleClassOutcome.UNSUPPORTED_OR_FAILED;
         }
     }
