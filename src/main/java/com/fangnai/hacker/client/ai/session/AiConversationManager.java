@@ -63,6 +63,13 @@ public final class AiConversationManager {
     private final AtomicReference<SavedToolInspectContext> savedToolInspectContext = new AtomicReference<>();
     private final AtomicReference<SavedToolRecoveryContext> savedToolRecoveryContext = new AtomicReference<>();
     private final Deque<AiMessage> contextMemory = new ArrayDeque<>();
+    /**
+     * 同一批“全部确认”里额外的 jar 分析提议：并进正在分析的流程里排队，不再各开一个流程互相顶掉。
+     * 队列里的分析依次执行，全部跑完后连同已完成的结果一起交给 AI。
+     */
+    private final Deque<JarAnalysisProposal> queuedWorkflowAnalyses = new java.util.concurrent.ConcurrentLinkedDeque<>();
+    /** 当前流程里已经跑完、等着和排队中的分析一起交给 AI 的分析结果。 */
+    private final List<JarAnalysisService.AnalysisRunResult> batchedAnalysisResults = new java.util.concurrent.CopyOnWriteArrayList<>();
     /** 超过这个长度的大块文本才会参与“重复就只留引用”的去重，短文本直接原样附上。 */
     private static final int DEDUP_MIN_CHARS = 200;
     /**
@@ -114,6 +121,7 @@ public final class AiConversationManager {
         savedToolInspectContext.set(null);
         savedToolRecoveryContext.set(null);
         currentWorkflowStep.set(null);
+        clearQueuedWorkflowAnalyses();
         currentPromptRequiresCompleteBuildBatch = isBuildCommandRequest(prompt);
         currentBuildBatchCorrectionAttempts = 0;
         currentBuildPrompt = currentPromptRequiresCompleteBuildBatch ? prompt : "";
@@ -140,6 +148,18 @@ public final class AiConversationManager {
                     proposal.memberPattern(), proposal.searchText(), proposal.reason(), proposal.expectedEffect());
             return;
         }
+        JarWorkflowContext running = jarWorkflowContext.get();
+        CompletableFuture<?> runningStep = currentWorkflowStep.get();
+        if (running != null && "analyzing".equals(running.phase()) && runningStep != null && !runningStep.isDone()) {
+            // 典型情况：AI 一次提了好几个分析，玩家点了“全部确认”。已经有流程在分析，这一个并进去排队，
+            // 不再另开新流程（新流程会把前一个流程顶掉，前一个分析的结果就丢了）。
+            queuedWorkflowAnalyses.add(proposal);
+            rememberSystemEvent("jar workflow " + running.workflowId() + " queued an extra analysis, will report all results together: "
+                    + proposal.summary());
+            ChatFeedback.info("jar 自动分析流程 " + running.workflowId() + " 正在分析，这个分析已并入该流程排队，"
+                    + "全部跑完后会一起交给 AI。");
+            return;
+        }
         CompletableFuture<?> request = currentRequest.get();
         if (request != null && !request.isDone()) {
             // 不再直接放弃：等当前请求结束后自动启动
@@ -148,6 +168,7 @@ public final class AiConversationManager {
             runLater(delay, () -> startJarAnalysisWorkflow(proposal, waitAttempt + 1));
             return;
         }
+        clearQueuedWorkflowAnalyses();
         String workflowId = java.util.UUID.randomUUID().toString().substring(0, 8);
         JarWorkflowContext context = new JarWorkflowContext(workflowId, proposal,
                 proposal.reason(), proposal.expectedEffect(), 0, 0, 0, 0,
@@ -236,7 +257,14 @@ public final class AiConversationManager {
         return true;
     }
 
+    /** 清掉排队中的分析和已跑完待汇总的结果：流程结束、被取消、被新流程取代时都要清，免得串到下一个流程里。 */
+    private void clearQueuedWorkflowAnalyses() {
+        queuedWorkflowAnalyses.clear();
+        batchedAnalysisResults.clear();
+    }
+
     private JarWorkflowContext newAutoRunContext(String goal, String expectedEffect) {
+        clearQueuedWorkflowAnalyses();
         compileRepairContext.set(null);
         savedToolInspectContext.set(null);
         savedToolRecoveryContext.set(null);
@@ -580,6 +608,7 @@ public final class AiConversationManager {
         savedToolInspectContext.set(null);
         savedToolRecoveryContext.set(null);
         JarWorkflowContext workflow = jarWorkflowContext.getAndSet(null);
+        clearQueuedWorkflowAnalyses();
         CompletableFuture<?> workflowStep = currentWorkflowStep.getAndSet(null);
         if (workflowStep != null && !workflowStep.isDone()) {
             workflowStep.cancel(true);
@@ -1027,32 +1056,89 @@ public final class AiConversationManager {
                 return;
             }
             if (throwable != null) {
-                retryWorkflowAfterStepError(active, proposal, "jar 分析异常：" + rootCause(throwable).getMessage());
+                retryWorkflowAfterStepError(withBatchedAnalysisContext(active), proposal,
+                        "jar 分析异常：" + rootCause(throwable).getMessage());
                 return;
             }
             if (result == null || !result.success()) {
-                retryWorkflowAfterStepError(active, proposal, "jar 分析失败：" + (result == null ? "未知错误" : result.errorMessage()));
+                retryWorkflowAfterStepError(withBatchedAnalysisContext(active), proposal,
+                        "jar 分析失败：" + (result == null ? "未知错误" : result.errorMessage()));
                 return;
             }
             ChatFeedback.info("jar 自动分析步骤完成：" + result.title() + "；完整输出=" + result.outputPath());
-            continueWorkflowWithAnalysisResult(active, result);
+            JarAnalysisProposal queued = queuedWorkflowAnalyses.poll();
+            if (queued != null) {
+                // 同一批确认里还有排队的分析：先把这个结果存起来，在同一个流程里接着跑下一个，全部跑完再一起交给 AI
+                batchedAnalysisResults.add(result);
+                runWorkflowJarAnalysis(active, queued);
+                return;
+            }
+            List<JarAnalysisService.AnalysisRunResult> results = new ArrayList<>(batchedAnalysisResults);
+            batchedAnalysisResults.clear();
+            results.add(result);
+            continueWorkflowWithAnalysisResults(active, results);
         }));
     }
 
-    private void continueWorkflowWithAnalysisResult(JarWorkflowContext context, JarAnalysisService.AnalysisRunResult result) {
+    /**
+     * 分析步骤出错时，把同一批里已经成功跑完的结果也带进上下文交给 AI，不让它们白跑；同时清掉剩下排队的分析，
+     * 让 AI 看完错误和已有结果后自己决定要不要重新提。
+     */
+    private JarWorkflowContext withBatchedAnalysisContext(JarWorkflowContext context) {
+        List<JarAnalysisService.AnalysisRunResult> done = new ArrayList<>(batchedAnalysisResults);
+        clearQueuedWorkflowAnalyses();
+        if (done.isEmpty()) {
+            return context;
+        }
+        HackerClientConfig.AiSettings settings = HackerClientConfig.ai();
+        return context.withLastAnalysis(joinAnalysisTitles(done))
+                .withLastAnalysisContext(describeAnalysisResults(done, settings.jarAnalysisWorkflowResultPreviewChars));
+    }
+
+    private static String joinAnalysisTitles(List<JarAnalysisService.AnalysisRunResult> results) {
+        List<String> titles = new ArrayList<>();
+        for (JarAnalysisService.AnalysisRunResult item : results) {
+            titles.add(item.title());
+        }
+        return String.join("；", titles);
+    }
+
+    /** 把一批分析结果写成给 AI 看的文本；只有一个结果时和以前的格式完全一样，多个时逐个标出序号和标题。 */
+    private static String describeAnalysisResults(List<JarAnalysisService.AnalysisRunResult> results, int previewChars) {
+        StringBuilder builder = new StringBuilder();
+        for (int i = 0; i < results.size(); i++) {
+            JarAnalysisService.AnalysisRunResult item = results.get(i);
+            if (results.size() > 1) {
+                if (i > 0) {
+                    builder.append("\n\n");
+                }
+                builder.append("【分析 ").append(i + 1).append('/').append(results.size()).append("：")
+                        .append(item.title()).append("】\n");
+            }
+            builder.append("完整输出路径：").append(item.outputPath()).append("\n分析内容预览：\n")
+                    .append(analysisPreview(item.content(), previewChars));
+        }
+        return builder.toString();
+    }
+
+    private void continueWorkflowWithAnalysisResults(JarWorkflowContext context,
+                                                     List<JarAnalysisService.AnalysisRunResult> results) {
         HackerClientConfig.AiSettings settings = HackerClientConfig.ai();
         JarWorkflowContext next = context.withAiTurns(context.aiTurns() + 1).withPhase("ai_continuation")
-                .withLastAnalysis(result.title())
-                .withLastAnalysisContext("完整输出路径：" + result.outputPath() + "\n分析内容预览：\n"
-                        + analysisPreview(result.content(), settings.jarAnalysisWorkflowResultPreviewChars));
+                .withLastAnalysis(joinAnalysisTitles(results))
+                .withLastAnalysisContext(describeAnalysisResults(results, settings.jarAnalysisWorkflowResultPreviewChars));
         jarWorkflowContext.set(next);
-        String prompt = buildWorkflowContinuationPrompt(next, result);
+        String prompt = buildWorkflowContinuationPrompt(next, results);
         if (prompt.length() > settings.jarAnalysisWorkflowPromptMaxChars) {
             prompt = prompt.substring(0, settings.jarAnalysisWorkflowPromptMaxChars) + "\n...工作流 prompt 已截断...";
         }
         List<AiMessage> messages = buildConversationMessages(settings, prompt);
+        List<String> outputs = new ArrayList<>();
+        for (JarAnalysisService.AnalysisRunResult item : results) {
+            outputs.add(String.valueOf(item.outputPath()));
+        }
         rememberSystemEvent("jar workflow " + next.workflowId() + " analysis step " + next.analysisSteps()
-                + " completed: " + result.title() + "; output=" + result.outputPath());
+                + " completed: " + joinAnalysisTitles(results) + "; output=" + String.join(", ", outputs));
         ChatFeedback.info("正在请求 AI 继续 jar 自动分析流程（AI 第 " + next.aiTurns() + " 轮）。");
         sendWorkflowRequest(next, messages, prompt.length(), "正在请求 AI 继续 jar 自动分析流程：", 0);
     }
@@ -1261,6 +1347,7 @@ public final class AiConversationManager {
             jarWorkflowContext.set(null);
         }
         currentWorkflowStep.set(null);
+        clearQueuedWorkflowAnalyses();
         status = success ? "idle" : "error";
         if (success) {
             ChatFeedback.info("自动流程结束：" + message);
@@ -1548,19 +1635,28 @@ public final class AiConversationManager {
     }
 
     private String buildWorkflowContinuationPrompt(JarWorkflowContext context,
-                                                   JarAnalysisService.AnalysisRunResult result) {
+                                                   List<JarAnalysisService.AnalysisRunResult> results) {
         HackerClientConfig.AiSettings settings = HackerClientConfig.ai();
         // 这条消息会完整带上本次分析内容；登记指纹，之后的纠错提示里再出现同样的分析上下文就只留引用
         noteBlock("最近一次分析上下文", context.lastAnalysisContext());
+        String analysisSection;
+        if (results.size() == 1) {
+            JarAnalysisService.AnalysisRunResult result = results.get(0);
+            analysisSection = "刚完成的分析：" + result.title() + "\n"
+                    + "完整输出路径：" + result.outputPath() + "\n"
+                    + "分析内容预览：\n```text\n" + analysisPreview(result.content(), settings.jarAnalysisWorkflowResultPreviewChars) + "\n```\n\n";
+        } else {
+            // 同一批确认的多个分析：下面按顺序全部给出，一次看完再决定下一步
+            analysisSection = "刚完成的 " + results.size() + " 个分析（它们是同一批一起确认的，按顺序给出）：\n"
+                    + "```text\n" + context.lastAnalysisContext() + "\n```\n\n";
+        }
         return "这是已授权的 jar 自动分析/生成/define 工作流。请根据最新分析结果继续，避免一次性长输出导致超时。\n"
                 + "workflowId=" + context.workflowId() + "\n"
                 + "原始目标/原因：" + context.goal() + "\n"
                 + "预期效果：" + context.expectedEffect() + "\n"
                 + "进度：analysisSteps=" + context.analysisSteps() + ", aiTurns=" + context.aiTurns()
                 + ", defineAttempts=" + context.defineAttempts() + ", repairs=" + context.compileRepairs() + "\n\n"
-                + "刚完成的分析：" + result.title() + "\n"
-                + "完整输出路径：" + result.outputPath() + "\n"
-                + "分析内容预览：\n```text\n" + analysisPreview(result.content(), settings.jarAnalysisWorkflowResultPreviewChars) + "\n```\n\n"
+                + analysisSection
                 + (context.lastRunReport().isBlank() ? "" : "最近一次自动执行结果：\n"
                 + dedupBlock("最近一次自动执行结果", context.lastRunReport(), 6000) + "\n")
                 + workflowOptions(context);
