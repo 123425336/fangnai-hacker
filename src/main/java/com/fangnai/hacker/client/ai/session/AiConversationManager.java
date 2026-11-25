@@ -153,7 +153,7 @@ public final class AiConversationManager {
                 proposal.reason(), proposal.expectedEffect(), 0, 0, 0, 0,
                 "starting", System.currentTimeMillis(), "");
         jarWorkflowContext.set(context);
-        rememberAssistantEvent("jar analysis workflow " + workflowId + " authorized by user: " + proposal.summary());
+        rememberSystemEvent("jar analysis workflow " + workflowId + " authorized by user: " + proposal.summary());
         ChatFeedback.info("已启动 jar 自动分析/生成/define 流程：id=" + workflowId
                 + "。出错时会自动把错误交给 AI 重试，可随时 /fangnai hacker cancel 或在 GUI 点停止。");
         runWorkflowJarAnalysis(context, proposal);
@@ -178,7 +178,7 @@ public final class AiConversationManager {
                 .withClassName(proposal.className())
                 .withRunMethod(proposal.runMethod());
         jarWorkflowContext.set(context);
-        rememberAssistantEvent("auto-run workflow " + context.workflowId() + " authorized by user: define "
+        rememberSystemEvent("auto-run workflow " + context.workflowId() + " authorized by user: define "
                 + proposal.className() + ", then run it automatically and repair until the goal is reached.");
         announceAutoRun(context);
         defineForWorkflow(context.withPhase("defining"), proposal);
@@ -199,7 +199,7 @@ public final class AiConversationManager {
         JarWorkflowContext context = newAutoRunContext(proposal.reason(), proposal.expectedEffect())
                 .withRunMethod(methodNameFromInput(proposal.input()));
         jarWorkflowContext.set(context);
-        rememberAssistantEvent("auto-run workflow " + context.workflowId() + " authorized by user: run saved tool "
+        rememberSystemEvent("auto-run workflow " + context.workflowId() + " authorized by user: run saved tool "
                 + proposal.toolId() + " and repair until the goal is reached.");
         announceAutoRun(context);
         runToolForWorkflow(context, proposal.toolId());
@@ -219,7 +219,7 @@ public final class AiConversationManager {
         }
         JarWorkflowContext context = newAutoRunContext(proposal.reason(), proposal.expectedEffect());
         jarWorkflowContext.set(context);
-        rememberAssistantEvent("dismantle workflow " + context.workflowId() + " authorized by user: " + proposal.summary());
+        rememberSystemEvent("dismantle workflow " + context.workflowId() + " authorized by user: " + proposal.summary());
         ChatFeedback.info("已启动隐藏类拆除与自动续步流程：id=" + context.workflowId() + "。可随时在 GUI 点停止。");
         runWorkflowDismantleHiddenClass(context, proposal);
     }
@@ -293,7 +293,7 @@ public final class AiConversationManager {
         compileRepairContext.set(context);
         String repairPrompt = buildCompileRepairPrompt(failedProposal, diagnostics, failureMessage, attempt);
         List<AiMessage> messages = buildConversationMessages(settings, repairPrompt);
-        rememberAssistantEvent("Java source for " + failedProposal.className()
+        rememberSystemEvent("Java source for " + failedProposal.className()
                 + " failed compile/preflight; diagnostics were sent back to AI for repair attempt " + attempt + ".");
         ChatFeedback.warn("Java 源码编译失败，正在把诊断发给 AI 自动修复（第 " + attempt + " 次）。");
         sendWithRetry(messages, repairPrompt.length(), "正在请求 AI 修复 Java 源码：", 0);
@@ -326,7 +326,7 @@ public final class AiConversationManager {
         HackerClientConfig.AiSettings settings = HackerClientConfig.ai();
         List<AiMessage> messages = buildConversationMessages(settings, prompt);
         ChatFeedback.warn("保存工具执行失败，已读取当前源码/方法并请求 AI 选择正确方法或修复源码（第 " + attempt + " 次）。");
-        rememberAssistantEvent("saved tool execution failed and current source/method inspection was sent to AI: tool="
+        rememberSystemEvent("saved tool execution failed and current source/method inspection was sent to AI: tool="
                 + result.toolId() + ", status=" + result.status() + ", methods=" + result.supportedMethods());
         sendWithRetry(messages, prompt.length(), "正在请求 AI 修复保存工具调用：", 0);
     }
@@ -512,7 +512,7 @@ public final class AiConversationManager {
                         + " 次）" + (configError ? "，修改设置后会自动使用新配置" : "")
                         + "；可在 GUI 点停止或 /fangnai hacker cancel 取消。");
                 if (retryAttempt == 0) {
-                    rememberAssistantEvent("AI request failed and will be retried: " + root.getClass().getSimpleName()
+                    rememberSystemEvent("AI request failed and will be retried: " + root.getClass().getSimpleName()
                             + (root.getMessage() == null ? "" : ": " + truncate(root.getMessage(), 300)));
                 }
                 scheduleRequestRetry(messages, promptChars, nextAttempt, delay);
@@ -590,11 +590,11 @@ public final class AiConversationManager {
             future.cancel(true);
             status = "cancelled";
             ChatFeedback.info("已取消当前 AI 请求。" + (workflow == null ? "" : "已停止自动流程：" + workflow.workflowId() + "。"));
-            rememberAssistantEvent("AI request cancelled by user" + (workflow == null ? "." : "; jar workflow " + workflow.workflowId() + " cancelled."));
+            rememberSystemEvent("AI request cancelled by user" + (workflow == null ? "." : "; jar workflow " + workflow.workflowId() + " cancelled."));
         } else if (workflow != null) {
             status = "cancelled";
             ChatFeedback.info("已停止自动流程：" + workflow.workflowId() + "。");
-            rememberAssistantEvent("jar workflow " + workflow.workflowId() + " cancelled by user.");
+            rememberSystemEvent("jar workflow " + workflow.workflowId() + " cancelled by user.");
         } else {
             ChatFeedback.info("没有进行中的 AI 请求。 ");
         }
@@ -659,8 +659,18 @@ public final class AiConversationManager {
         return Long.toString(tokens);
     }
 
-    public void rememberAssistantEvent(String content) {
-        appendMemory("assistant", content);
+    /**
+     * 把系统事件（提议了什么操作、玩家是否确认、执行结果、报错等）记进上下文记忆。
+     * 这些不是模型说过的话，所以用 user 身份并加上“【系统记录】”开头。
+     * 以前用 assistant 身份记录，模型会把整段历史当成“自己一直是这样用文字回复的”，
+     * 之后有时就原样复述一遍记录文字而不调用工具（自动分析流程里表现为“只回复了文字”）。
+     * 只有模型真正返回的文字回复才用 assistant 身份记录。
+     */
+    public void rememberSystemEvent(String content) {
+        if (content == null || content.isBlank()) {
+            return;
+        }
+        appendMemory("user", ContextMemoryCompressor.SYSTEM_RECORD_PREFIX + content.trim());
     }
 
     public void tick() {
@@ -685,7 +695,7 @@ public final class AiConversationManager {
         for (AiToolCall call : response.toolCalls()) {
             if (jarWorkflowContext.get() != null && workflowHandled) {
                 LOGGER.warn("[Fangnai AI] Extra workflow tool call ignored: {}", call.name());
-                rememberAssistantEvent("jar workflow ignored extra tool call: " + call.name());
+                rememberSystemEvent("jar workflow ignored extra tool call: " + call.name());
                 continue;
             }
             LOGGER.info("[Fangnai AI] Tool call proposed: name={}, id={}", call.name(), call.id());
@@ -713,7 +723,7 @@ public final class AiConversationManager {
                     break;
                 }
                 LOGGER.warn("[Fangnai AI] Unknown tool call ignored: {}", call.name());
-                rememberAssistantEvent("AI proposed unknown tool call and it was ignored: " + call.name());
+                rememberSystemEvent("AI proposed unknown tool call and it was ignored: " + call.name());
             }
         }
         if (readOnlyContinuationStarted) {
@@ -765,7 +775,7 @@ public final class AiConversationManager {
                 return;
             }
             ChatFeedback.warn("AI 返回为空。");
-            rememberAssistantEvent("AI returned empty response.");
+            rememberSystemEvent("AI returned empty response.");
         }
 
         flushBatchProposals(batchPendingProposals);
@@ -775,7 +785,7 @@ public final class AiConversationManager {
      * 收集普通 pending proposal 到批量列表，或直接处理修复/workflow proposal。
      */
     private void collectOrRepair(ActionProposal proposal, List<ActionProposal> batchPendingProposals) {
-        rememberAssistantEvent("proposed action " + proposal.type() + ": " + proposal.summary());
+        rememberSystemEvent("proposed action " + proposal.type() + ": " + proposal.summary());
         JarWorkflowContext workflow = jarWorkflowContext.get();
         if (workflow != null) {
             handleWorkflowProposal(workflow, proposal);
@@ -851,7 +861,7 @@ public final class AiConversationManager {
 
     private void rejectSingleBuildCommandAndRetry(VanillaCommandProposal proposal) {
         currentBuildBatchCorrectionAttempts++;
-        rememberAssistantEvent("single build command was rejected because building requests require one complete command batch: "
+        rememberSystemEvent("single build command was rejected because building requests require one complete command batch: "
                 + proposal.summary());
         ChatFeedback.warn("建造任务需要一次性返回完整命令列表；已拒绝单条命令并要求 AI 改为批量命令。单条命令：/" + proposal.command());
         String correctionPrompt = buildSingleBuildCommandCorrectionPrompt(proposal);
@@ -863,7 +873,7 @@ public final class AiConversationManager {
 
     private void rejectSingleBuildCommandAndRetry(VanillaCommandsProposal proposal) {
         currentBuildBatchCorrectionAttempts++;
-        rememberAssistantEvent("single-command build batch was rejected because building requests require a complete command batch: "
+        rememberSystemEvent("single-command build batch was rejected because building requests require a complete command batch: "
                 + proposal.summary());
         ChatFeedback.warn("建造任务需要一次性返回完整命令列表；已拒绝只有一条命令的批量操作并要求 AI 重新生成完整批次。单条命令：/" + proposal.firstCommand());
         String correctionPrompt = buildSingleBuildCommandCorrectionPrompt(proposal.firstCommand());
@@ -904,7 +914,7 @@ public final class AiConversationManager {
         } else {
             ChatFeedback.warn("查看保存工具失败：" + inspection.message());
         }
-        rememberAssistantEvent("inspect_saved_tool result for " + toolId + ": success=" + inspection.success()
+        rememberSystemEvent("inspect_saved_tool result for " + toolId + ": success=" + inspection.success()
                 + ", methods=" + inspection.callableMethods() + ", source=" + inspection.sourcePath());
         String prompt = buildSavedToolInspectionContinuationPrompt(inspection, question, attempt);
         HackerClientConfig.AiSettings settings = HackerClientConfig.ai();
@@ -957,7 +967,7 @@ public final class AiConversationManager {
                     + "\n...工作流协议纠错 prompt 已截断...";
         }
         List<AiMessage> messages = buildConversationMessages(settings, prompt);
-        rememberAssistantEvent("jar workflow " + next.workflowId() + " rejected invalid tool " + attemptedTool
+        rememberSystemEvent("jar workflow " + next.workflowId() + " rejected invalid tool " + attemptedTool
                 + " and requested correction at AI turn " + next.aiTurns() + ".");
         ChatFeedback.warn("jar 自动分析流程收到无效回复 " + attemptedTool
                 + "；已把错误返回 AI 并继续流程（AI 第 " + next.aiTurns() + " 轮）。");
@@ -974,7 +984,7 @@ public final class AiConversationManager {
             prompt = prompt.substring(0, settings.jarAnalysisWorkflowPromptMaxChars) + "\n...工作流重试 prompt 已截断...";
         }
         List<AiMessage> messages = buildConversationMessages(settings, prompt);
-        rememberAssistantEvent("jar workflow " + next.workflowId() + " analysis step failed and was returned to AI for retry: "
+        rememberSystemEvent("jar workflow " + next.workflowId() + " analysis step failed and was returned to AI for retry: "
                 + truncate(error, 400));
         ChatFeedback.warn("jar 分析步骤出错：" + truncate(error, 300) + "；已把错误交给 AI 修正后重试（AI 第 "
                 + next.aiTurns() + " 轮）。");
@@ -1041,7 +1051,7 @@ public final class AiConversationManager {
             prompt = prompt.substring(0, settings.jarAnalysisWorkflowPromptMaxChars) + "\n...工作流 prompt 已截断...";
         }
         List<AiMessage> messages = buildConversationMessages(settings, prompt);
-        rememberAssistantEvent("jar workflow " + next.workflowId() + " analysis step " + next.analysisSteps()
+        rememberSystemEvent("jar workflow " + next.workflowId() + " analysis step " + next.analysisSteps()
                 + " completed: " + result.title() + "; output=" + result.outputPath());
         ChatFeedback.info("正在请求 AI 继续 jar 自动分析流程（AI 第 " + next.aiTurns() + " 轮）。");
         sendWorkflowRequest(next, messages, prompt.length(), "正在请求 AI 继续 jar 自动分析流程：", 0);
@@ -1066,7 +1076,7 @@ public final class AiConversationManager {
             prompt = prompt.substring(0, settings.jarAnalysisWorkflowPromptMaxChars) + "\n...工作流 prompt 已截断...";
         }
         List<AiMessage> messages = buildConversationMessages(settings, prompt);
-        rememberAssistantEvent("jar workflow " + next.workflowId() + " dismantled hidden classes for target="
+        rememberSystemEvent("jar workflow " + next.workflowId() + " dismantled hidden classes for target="
                 + proposal.targetPattern() + ": success=" + result.success()
                 + ", newlyDismantled=" + result.newlyDismantled().size()
                 + ", alreadyDismantled=" + result.alreadyDismantled().size());
@@ -1173,7 +1183,7 @@ public final class AiConversationManager {
             prompt = prompt.substring(0, settings.jarAnalysisWorkflowPromptMaxChars) + "\n...执行结果 prompt 已截断...";
         }
         List<AiMessage> messages = buildConversationMessages(settings, prompt);
-        rememberAssistantEvent("auto-run workflow " + next.workflowId() + " round " + next.runRounds() + " executed "
+        rememberSystemEvent("auto-run workflow " + next.workflowId() + " round " + next.runRounds() + " executed "
                 + next.className() + "." + next.runMethod() + "(): " + truncate(report, 600));
         ChatFeedback.info("第 " + next.runRounds() + " 轮执行结果已交给香草判断是否达成目标…");
         sendWorkflowRequest(next, messages, prompt.length(), "正在请香草判断执行结果：", 0);
@@ -1239,7 +1249,7 @@ public final class AiConversationManager {
             prompt = prompt.substring(0, settings.jarAnalysisWorkflowPromptMaxChars) + "\n...修复 prompt 已截断...";
         }
         List<AiMessage> messages = buildConversationMessages(settings, prompt);
-        rememberAssistantEvent("jar workflow " + next.workflowId() + " Java source failed; repair "
+        rememberSystemEvent("jar workflow " + next.workflowId() + " Java source failed; repair "
                 + next.compileRepairs() + " requested.");
         ChatFeedback.warn("Java 源码/define 失败，正在请求 AI 自动修复（第 " + next.compileRepairs() + " 次）：" + failureMessage);
         sendWorkflowRequest(next, messages, prompt.length(), "正在请求 AI 修复 jar 工作流 Java 源码：", 0);
@@ -1257,7 +1267,7 @@ public final class AiConversationManager {
         } else {
             ChatFeedback.warn("自动流程停止：" + message);
         }
-        rememberAssistantEvent("jar workflow " + context.workflowId() + " finished success=" + success + ": " + message);
+        rememberSystemEvent("jar workflow " + context.workflowId() + " finished success=" + success + ": " + message);
     }
 
     private void preflightJavaSource(JavaSourceDefineProposal proposal) {
@@ -1266,7 +1276,7 @@ public final class AiConversationManager {
         if (check.success()) {
             compileRepairContext.set(null);
             ChatFeedback.info("Java 源码预编译成功，已生成待确认 define/redefine 操作：" + proposal.className());
-            rememberAssistantEvent("Java source for " + proposal.className()
+            rememberSystemEvent("Java source for " + proposal.className()
                     + " passed preflight compile and is pending user confirmation.");
             PendingActionRegistry.get().add(proposal);
             return;

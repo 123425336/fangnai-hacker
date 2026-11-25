@@ -230,7 +230,7 @@ public final class FangnaiHackerCommands {
         EntityClearProposal clearProposal = EntityClearProposal.fromPrompt(prompt);
         if (clearProposal != null) {
             PendingActionRegistry.get().add(clearProposal);
-            AiConversationManager.get().rememberAssistantEvent("local entity clear intent proposed: " + clearProposal.summary());
+            AiConversationManager.get().rememberSystemEvent("local entity clear intent proposed: " + clearProposal.summary());
             return 1;
         }
         if (EntityClearProposal.needsAiTargetResolution(prompt)) {

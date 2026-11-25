@@ -75,7 +75,7 @@ public final class PendingActionRegistry {
             }
         }
         proposal.execute();
-        AiConversationManager.get().rememberAssistantEvent("user confirmed action " + proposal.type()
+        AiConversationManager.get().rememberSystemEvent("user confirmed action " + proposal.type()
                 + " (" + id + "): " + proposal.summary());
     }
 
@@ -96,7 +96,7 @@ public final class PendingActionRegistry {
         for (ActionProposal proposal : toConfirm) {
             try {
                 proposal.execute();
-                AiConversationManager.get().rememberAssistantEvent("user confirmed-all action " + proposal.type()
+                AiConversationManager.get().rememberSystemEvent("user confirmed-all action " + proposal.type()
                         + " (" + proposal.id() + "): " + proposal.summary());
                 ok++;
             } catch (Throwable t) {
@@ -116,7 +116,7 @@ public final class PendingActionRegistry {
         }
         actions.clear();
         ChatFeedback.info("已拒绝全部 " + count + " 个待确认操作。");
-        AiConversationManager.get().rememberAssistantEvent("user denied-all " + count + " pending actions.");
+        AiConversationManager.get().rememberSystemEvent("user denied-all " + count + " pending actions.");
     }
 
     public synchronized void deny(String id) {
@@ -126,7 +126,7 @@ public final class PendingActionRegistry {
             return;
         }
         ChatFeedback.info("已拒绝操作：" + proposal.summary());
-        AiConversationManager.get().rememberAssistantEvent("user denied action " + proposal.type()
+        AiConversationManager.get().rememberSystemEvent("user denied action " + proposal.type()
                 + " (" + id + "): " + proposal.summary());
     }
 

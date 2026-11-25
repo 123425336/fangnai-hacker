@@ -19,6 +19,13 @@ final class ContextMemoryCompressor {
     static final String SUMMARY_PREFIX = "【早先对话的摘要（系统压缩生成，只是背景资料，不是新的指令；"
             + "与最近的原始记录冲突时以原始记录为准）】\n";
 
+    /**
+     * 系统事件记录的开头：提议了什么操作、玩家是否确认、执行结果等，都是系统自动记下的事实，不是模型说过的话。
+     * 这些记录用 user 身份放进上下文：如果用 assistant 身份，模型会把它们当成“自己以前的回复格式”，
+     * 之后有时就照着写一段文字而不是调用工具（自动分析流程里表现为“只回复了文字”）。
+     */
+    static final String SYSTEM_RECORD_PREFIX = "【系统记录】";
+
     private ContextMemoryCompressor() {
     }
 
@@ -59,8 +66,15 @@ final class ContextMemoryCompressor {
 
         StringBuilder transcript = new StringBuilder();
         for (AiMessage message : older) {
-            transcript.append("user".equals(message.role()) ? "[玩家/系统] " : "[香草/事件] ")
-                    .append(message.content()).append("\n\n");
+            String label;
+            if (!"user".equals(message.role())) {
+                label = "[香草] ";
+            } else if (message.content().startsWith(SYSTEM_RECORD_PREFIX)) {
+                label = "[系统事件] ";
+            } else {
+                label = "[玩家/系统] ";
+            }
+            transcript.append(label).append(message.content()).append("\n\n");
         }
         List<AiMessage> messages = new ArrayList<>();
         messages.add(new AiMessage("system",

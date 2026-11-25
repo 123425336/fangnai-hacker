@@ -43,7 +43,7 @@ public final class SavedToolProposal extends ActionProposal {
         }
         if (result.success()) {
             AiConversationManager.get().clearSavedToolRecovery();
-            AiConversationManager.get().rememberAssistantEvent("saved tool execution succeeded: "
+            AiConversationManager.get().rememberSystemEvent("saved tool execution succeeded: "
                     + result.toolId() + "." + result.invokedMethod() + "() status=" + result.status());
             return;
         }
